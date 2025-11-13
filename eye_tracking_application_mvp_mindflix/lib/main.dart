@@ -1,201 +1,256 @@
 import 'dart:async';
-import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:camera/camera.dart';
 import 'package:google_mlkit_face_detection/google_mlkit_face_detection.dart';
 
-void main() async {
+Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
-
-  // 🔹 Lock app to landscape orientation
   await SystemChrome.setPreferredOrientations([
     DeviceOrientation.landscapeLeft,
     DeviceOrientation.landscapeRight,
   ]);
-
-  // 🔹 Use front camera (webcam for emulator)
   final cameras = await availableCameras();
-  final frontCamera = cameras.firstWhere(
-    (cam) => cam.lensDirection == CameraLensDirection.front,
+  final front = cameras.firstWhere(
+    (c) => c.lensDirection == CameraLensDirection.front,
     orElse: () => cameras.first,
   );
-
-  runApp(MyApp(camera: frontCamera));
+  runApp(MyApp(camera: front));
 }
 
 class MyApp extends StatelessWidget {
   final CameraDescription camera;
   const MyApp({super.key, required this.camera});
-
   @override
-  Widget build(BuildContext context) {
-    return MaterialApp(
-      title: 'Gaze Tracker (ML Kit)',
-      debugShowCheckedModeBanner: false,
-      theme: ThemeData.dark(),
-      home: GazeTracker(camera: camera),
-    );
-  }
+  Widget build(BuildContext context) => MaterialApp(
+    debugShowCheckedModeBanner: false,
+    theme: ThemeData.dark(),
+    home: GazeTracker(camera: camera),
+  );
 }
 
 class GazeTracker extends StatefulWidget {
   final CameraDescription camera;
   const GazeTracker({super.key, required this.camera});
-
   @override
   State<GazeTracker> createState() => _GazeTrackerState();
 }
 
-class _GazeTrackerState extends State<GazeTracker> {
+class _GazeTrackerState extends State<GazeTracker>
+    with SingleTickerProviderStateMixin {
   late CameraController _controller;
-  late FaceDetector _faceDetector;
-  bool _isReady = false;
-  bool _isRunning = false;
-  int _secondsLeft = 10;
-  Timer? _frameTimer;
-  Timer? _countdownTimer;
-  int _leftCount = 0;
-  int _rightCount = 0;
-  double _dotX = 0; // 👁 dot position on screen
+  late FaceDetector _detector;
+  bool _ready = false,
+      _running = false,
+      _calibrating = false,
+      _calibrated = false;
+  bool _flipX = false, _flipY = true;
+  double _dotX = 0, _dotY = 0, _calibX = 0, _calibY = 0;
+  int _left = 0, _right = 0, _secs = 10;
+  Timer? _frameT, _countT;
+  double _xSens = 10.0, _ySens = 8.0; // amplified default
+  late final AnimationController _blink;
+  late final Animation<double> _blinkOp;
 
   @override
   void initState() {
     super.initState();
-    _initCamera();
-    _initFaceDetector();
+    _blink = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 800),
+    )..repeat(reverse: true);
+    _blinkOp = Tween(begin: 0.3, end: 1.0).animate(_blink);
+    _init();
   }
 
-  Future<void> _initCamera() async {
+  Future<void> _init() async {
     _controller = CameraController(
       widget.camera,
       ResolutionPreset.low,
       enableAudio: false,
     );
     await _controller.initialize();
-    if (!mounted) return;
-    setState(() => _isReady = true);
-  }
-
-  void _initFaceDetector() {
-    _faceDetector = FaceDetector(
+    _detector = FaceDetector(
       options: FaceDetectorOptions(
         enableLandmarks: true,
-        enableContours: true,
         performanceMode: FaceDetectorMode.fast,
       ),
     );
+    setState(() => _ready = true);
   }
 
-  void _startTimer() {
-    if (_isRunning) return;
-    setState(() {
-      _isRunning = true;
-      _secondsLeft = 10;
-      _leftCount = 0;
-      _rightCount = 0;
-      _dotX = MediaQuery.of(context).size.width / 2;
-    });
+  Future<Offset?> _eyePos() async {
+    try {
+      final pic = await _controller.takePicture();
+      final img = InputImage.fromFilePath(pic.path);
+      final faces = await _detector.processImage(img);
+      if (faces.isEmpty) return null;
+      double x = 0, y = 0;
+      int n = 0;
+      for (var f in faces) {
+        final l = f.landmarks[FaceLandmarkType.leftEye];
+        final r = f.landmarks[FaceLandmarkType.rightEye];
+        if (l != null && r != null) {
+          x += (l.position.x + r.position.x) / 2;
+          y += (l.position.y + r.position.y) / 2;
+          n++;
+        }
+      }
+      return n == 0 ? null : Offset(x / n, y / n);
+    } catch (_) {
+      return null;
+    }
+  }
 
-    _countdownTimer = Timer.periodic(const Duration(seconds: 1), (timer) {
-      setState(() => _secondsLeft--);
-      if (_secondsLeft <= 0) {
-        timer.cancel();
-        _stopTracking();
+  Future<void> _calibrate() async {
+    if (_running || _calibrating) return;
+    setState(() => _calibrating = true);
+    final s = MediaQuery.of(context).size;
+    final pts = [
+      Offset(s.width * .1, s.height * .1),
+      Offset(s.width * .9, s.height * .1),
+      Offset(s.width * .1, s.height * .9),
+      Offset(s.width * .9, s.height * .9),
+      Offset(s.width * .5, s.height * .5),
+    ];
+    double tx = 0, ty = 0;
+    int n = 0;
+    for (var p in pts) {
+      setState(() {
+        _dotX = p.dx;
+        _dotY = p.dy;
+      });
+      for (int i = 0; i < 4; i++) {
+        await Future.delayed(const Duration(milliseconds: 500));
+        final e = await _eyePos();
+        if (e != null) {
+          tx += e.dx;
+          ty += e.dy;
+          n++;
+        }
+      }
+    }
+    if (n > 0) {
+      _calibX = tx / n;
+      _calibY = ty / n;
+      _calibrated = true;
+      _show("✅ Calibration Complete", "You can start the test now.");
+    } else {
+      _show("⚠️ Calibration Failed", "Please retry.");
+    }
+    setState(() => _calibrating = false);
+  }
+
+  void _start() {
+    if (!_calibrated) return _snack("Please calibrate first!");
+    if (_running) return;
+    setState(() {
+      _running = true;
+      _secs = 10;
+      _left = 0;
+      _right = 0;
+    });
+    _countT = Timer.periodic(const Duration(seconds: 1), (t) {
+      setState(() => _secs--);
+      if (_secs <= 0) {
+        t.cancel();
+        _stop();
       }
     });
-
-    _frameTimer = Timer.periodic(const Duration(milliseconds: 500), (_) async {
+    _frameT = Timer.periodic(const Duration(milliseconds: 500), (_) async {
       if (!_controller.value.isInitialized || _controller.value.isTakingPicture)
         return;
-      try {
-        final pic = await _controller.takePicture();
-        await _analyzeFrame(pic.path);
-      } catch (e) {
-        debugPrint("Frame error: $e");
-      }
+      final pic = await _controller.takePicture();
+      await _analyze(pic.path);
     });
   }
 
-  Future<void> _analyzeFrame(String path) async {
-    final inputImage = InputImage.fromFilePath(path);
-    final faces = await _faceDetector.processImage(inputImage);
+  Future<void> _analyze(String path) async {
+    final img = InputImage.fromFilePath(path);
+    final faces = await _detector.processImage(img);
     if (faces.isEmpty) return;
-
-    final width = MediaQuery.of(context).size.width;
-    double avgX = 0;
-    for (final face in faces) {
-      avgX += face.boundingBox.center.dx;
+    final s = MediaQuery.of(context).size;
+    double x = 0, y = 0;
+    int n = 0;
+    for (var f in faces) {
+      final l = f.landmarks[FaceLandmarkType.leftEye];
+      final r = f.landmarks[FaceLandmarkType.rightEye];
+      if (l != null && r != null) {
+        x += (l.position.x + r.position.x) / 2;
+        y += (l.position.y + r.position.y) / 2;
+        n++;
+      }
     }
-    avgX /= faces.length;
-
-    // Normalize and invert so movement feels natural (mirror effect)
-    double normalizedX = (1 - (avgX / 300)) * width;
+    if (n == 0) return;
+    x /= n;
+    y /= n;
+    final p = _controller.value.previewSize!;
+    double nx = _flipX ? (1 - x / p.width) * s.width : (x / p.width) * s.width;
+    double ny = _flipY
+        ? (1 - y / p.height) * s.height
+        : (y / p.height) * s.height;
+    double dx =
+        ((nx - s.width / 2) - ((_calibX / p.width - .5) * s.width)) * _xSens +
+        s.width / 2;
+    double dy =
+        ((ny - s.height / 2) - ((_calibY / p.height - .5) * s.height)) *
+            _ySens +
+        s.height / 2;
     setState(() {
-      _dotX = normalizedX.clamp(0, width);
+      _dotX = dx.clamp(0, s.width);
+      _dotY = dy.clamp(0, s.height);
     });
-
-    // Count gaze direction
-    if (normalizedX < width / 2) {
-      _leftCount++;
-    } else {
-      _rightCount++;
-    }
+    if (dx < s.width / 2)
+      _left++;
+    else
+      _right++;
   }
 
-  Future<void> _stopTracking() async {
-    _frameTimer?.cancel();
-    _countdownTimer?.cancel();
-    setState(() => _isRunning = false);
+  Future<void> _stop() async {
+    _frameT?.cancel();
+    _countT?.cancel();
+    setState(() => _running = false);
+    final res = _left > _right
+        ? "👁 Looked more at LEFT image"
+        : _right > _left
+        ? "👁 Looked more at RIGHT image"
+        : "🤷‍♂️ Looked equally at both";
+    _show("Test Result", "⏱ 10s\n👈 $_left left\n👉 $_right right\n\n$res");
+  }
 
-    String result;
-    if (_leftCount > _rightCount) {
-      result = "👁 Looked more at LEFT image";
-    } else if (_rightCount > _leftCount) {
-      result = "👁 Looked more at RIGHT image";
-    } else {
-      result = "🤷‍♂️ Looked equally at both";
-    }
-
-    if (mounted) {
-      showDialog(
-        context: context,
-        barrierDismissible: false,
-        builder: (_) => AlertDialog(
-          title: const Text("Result"),
-          content: Text("$_leftCount left vs $_rightCount right\n\n$result"),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.pop(context),
-              child: const Text("OK"),
-            ),
-          ],
+  void _snack(String t) =>
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(t)));
+  void _show(String t, String m) => showDialog(
+    context: context,
+    builder: (_) => AlertDialog(
+      title: Text(t),
+      content: Text(m),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(context),
+          child: const Text("OK"),
         ),
-      );
-    }
-  }
+      ],
+    ),
+  );
 
   @override
   void dispose() {
     _controller.dispose();
-    _faceDetector.close();
-    _frameTimer?.cancel();
-    _countdownTimer?.cancel();
+    _detector.close();
+    _blink.dispose();
+    _frameT?.cancel();
+    _countT?.cancel();
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
-    if (!_isReady) {
+    if (!_ready)
       return const Scaffold(body: Center(child: CircularProgressIndicator()));
-    }
-
-    final width = MediaQuery.of(context).size.width;
-
     return Scaffold(
       body: Stack(
         children: [
-          // 🔹 Equal-sized images side by side
           Row(
             children: [
               Expanded(
@@ -209,30 +264,29 @@ class _GazeTrackerState extends State<GazeTracker> {
               ),
             ],
           ),
-
-          // 🔹 Floating gaze dot
           AnimatedPositioned(
-            duration: const Duration(milliseconds: 300),
+            duration: const Duration(milliseconds: 250),
             left: _dotX - 10,
-            top: 40,
-            child: Container(
-              width: 20,
-              height: 20,
-              decoration: BoxDecoration(
-                color: Colors.blueAccent,
-                shape: BoxShape.circle,
-                boxShadow: [
-                  BoxShadow(
-                    color: Colors.blueAccent.withOpacity(0.6),
-                    blurRadius: 8,
-                    spreadRadius: 3,
-                  ),
-                ],
+            top: _dotY - 10,
+            child: FadeTransition(
+              opacity: _blinkOp,
+              child: Container(
+                width: 20,
+                height: 20,
+                decoration: BoxDecoration(
+                  color: _calibrating ? Colors.orangeAccent : Colors.blueAccent,
+                  shape: BoxShape.circle,
+                  boxShadow: [
+                    BoxShadow(
+                      color: Colors.blueAccent.withOpacity(.6),
+                      blurRadius: 8,
+                      spreadRadius: 3,
+                    ),
+                  ],
+                ),
               ),
             ),
           ),
-
-          // 🔹 Bottom overlay (timer + button)
           Align(
             alignment: Alignment.bottomCenter,
             child: Padding(
@@ -241,25 +295,90 @@ class _GazeTrackerState extends State<GazeTracker> {
                 mainAxisSize: MainAxisSize.min,
                 children: [
                   Text(
-                    _isRunning
-                        ? "Time left: $_secondsLeft s"
-                        : "Press Start to begin",
-                    style: const TextStyle(fontSize: 24, color: Colors.white),
+                    _calibrating
+                        ? "Calibrating..."
+                        : _running
+                        ? "Time left: $_secs s"
+                        : _calibrated
+                        ? "✅ Calibrated! Ready"
+                        : "Press Calibrate",
+                    style: const TextStyle(fontSize: 20),
                   ),
                   const SizedBox(height: 10),
-                  ElevatedButton(
-                    onPressed: _isRunning ? null : _startTimer,
-                    style: ElevatedButton.styleFrom(
-                      backgroundColor: Colors.greenAccent.shade700,
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 60,
-                        vertical: 20,
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      ElevatedButton(
+                        onPressed: _running || _calibrating ? null : _calibrate,
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: Colors.orange,
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 40,
+                            vertical: 18,
+                          ),
+                        ),
+                        child: const Text(
+                          "Calibrate",
+                          style: TextStyle(fontSize: 18),
+                        ),
                       ),
-                    ),
-                    child: const Text(
-                      "Start 10-second Test",
-                      style: TextStyle(fontSize: 20),
-                    ),
+                      const SizedBox(width: 20),
+                      ElevatedButton(
+                        onPressed: _running || _calibrating ? null : _start,
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: Colors.green,
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 40,
+                            vertical: 18,
+                          ),
+                        ),
+                        child: const Text(
+                          "Start Test",
+                          style: TextStyle(fontSize: 18),
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 12),
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      const Text("Flip X"),
+                      Switch(
+                        value: _flipX,
+                        onChanged: (v) => setState(() => _flipX = v),
+                      ),
+                      const SizedBox(width: 30),
+                      const Text("Flip Y"),
+                      Switch(
+                        value: _flipY,
+                        onChanged: (v) => setState(() => _flipY = v),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 10),
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      const Text("X Sensitivity"),
+                      Slider(
+                        value: _xSens,
+                        min: 2,
+                        max: 15,
+                        divisions: 13,
+                        label: _xSens.toStringAsFixed(1),
+                        onChanged: (v) => setState(() => _xSens = v),
+                      ),
+                      const Text("Y Sensitivity"),
+                      Slider(
+                        value: _ySens,
+                        min: 2,
+                        max: 15,
+                        divisions: 13,
+                        label: _ySens.toStringAsFixed(1),
+                        onChanged: (v) => setState(() => _ySens = v),
+                      ),
+                    ],
                   ),
                 ],
               ),
