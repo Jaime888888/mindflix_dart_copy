@@ -70,6 +70,7 @@ class _GazeTrackerState extends State<GazeTracker>
       enableAudio: false,
     );
     await _controller.initialize();
+    await _controller.setFlashMode(FlashMode.off);
     _detector = FaceDetector(
       options: FaceDetectorOptions(
         enableLandmarks: true,
