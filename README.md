@@ -50,3 +50,9 @@ The app detects eye movements using the front camera, calibrates gaze positions,
    dependencies:
      camera: ^0.11.0
      google_mlkit_face_detection: ^0.11.0
+   
+---
+
+## History of changes: 
+
+- 11/17/25 : Updated the Podfile to set a target iOS version to avoid an ML Kit error, and modified main.dart to stop the white flashing by turning the flash off.
