@@ -7,8 +7,7 @@ import 'package:google_mlkit_face_detection/google_mlkit_face_detection.dart';
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await SystemChrome.setPreferredOrientations([
-    DeviceOrientation.landscapeLeft,
-    DeviceOrientation.landscapeRight,
+    DeviceOrientation.portraitUp,
   ]);
   final cameras = await availableCameras();
   final front = cameras.firstWhere(
@@ -42,7 +41,6 @@ class _GazeTrackerState extends State<GazeTracker>
   late FaceDetector _detector;
   bool _ready = false;
   bool _tracking = false;
-  bool _flipX = false, _flipY = true;
   Offset _dot = Offset.zero;
   final List<Offset> _history = [];
   static const int _maxHistory = 6;
@@ -117,12 +115,8 @@ class _GazeTrackerState extends State<GazeTracker>
     final screen = MediaQuery.of(context).size;
     final raw = Offset(x / n, y / n);
     final mapped = Offset(
-      _flipX
-          ? (1 - raw.dx / preview.width) * screen.width
-          : (raw.dx / preview.width) * screen.width,
-      _flipY
-          ? (1 - raw.dy / preview.height) * screen.height
-          : (raw.dy / preview.height) * screen.height,
+      (raw.dx / preview.width) * screen.width,
+      (raw.dy / preview.height) * screen.height,
     );
 
     _history.add(mapped);
@@ -193,28 +187,6 @@ class _GazeTrackerState extends State<GazeTracker>
                     ),
                   ],
                 ),
-              ),
-            ),
-          ),
-          Align(
-            alignment: Alignment.bottomCenter,
-            child: Padding(
-              padding: const EdgeInsets.only(bottom: 30),
-              child: Row(
-                mainAxisAlignment: MainAxisAlignment.center,
-                children: [
-                  const Text("Flip X", style: TextStyle(color: Colors.white)),
-                  Switch(
-                    value: _flipX,
-                    onChanged: (v) => setState(() => _flipX = v),
-                  ),
-                  const SizedBox(width: 24),
-                  const Text("Flip Y", style: TextStyle(color: Colors.white)),
-                  Switch(
-                    value: _flipY,
-                    onChanged: (v) => setState(() => _flipY = v),
-                  ),
-                ],
               ),
             ),
           ),
