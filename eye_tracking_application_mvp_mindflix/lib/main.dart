@@ -121,19 +121,11 @@ class _GazeTrackerState extends State<GazeTracker>
     final data = bytes.done().buffer.asUint8List();
     return InputImage.fromBytes(
       bytes: data,
-      inputImageData: InputImageData(
+      metadata: InputImageMetadata(
         size: Size(image.width.toDouble(), image.height.toDouble()),
-        imageRotation: rotation,
-        inputImageFormat: format,
-        planeData: image.planes
-            .map(
-              (p) => InputImagePlaneMetadata(
-                bytesPerRow: p.bytesPerRow,
-                height: p.height,
-                width: p.width,
-              ),
-            )
-            .toList(),
+        rotation: rotation,
+        format: format,
+        bytesPerRow: image.planes.first.bytesPerRow,
       ),
     );
   }
