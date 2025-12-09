@@ -50,7 +50,9 @@ class _GazeTrackerState extends State<GazeTracker>
   Offset _dot = Offset.zero;
   final List<Offset> _history = [];
   static const int _maxHistory = 6;
-  static const int _logEveryNFrames = 24;
+  static const int _logEveryNFrames = 90;
+  static const double _maxNormalizedJump = 0.2;
+  static const double _emaWeight = 0.35;
   int _frameCounter = 0;
   late final AnimationController _blink;
   late final Animation<double> _blinkOp;
@@ -70,12 +72,15 @@ class _GazeTrackerState extends State<GazeTracker>
   int _calibrationIndex = 0;
   int _displayTargetIndex = 0;
   bool _isCollecting = false;
+  Timer? _collectDelayTimer;
   Timer? _calibrationTimer;
   static const Duration _dwellDuration = Duration(seconds: 4);
   static const Duration _travelDuration = Duration(seconds: 1);
+  static const Duration _settleDuration = Duration(seconds: 1);
   Offset _mappingSlope = const Offset(1, 1);
   Offset _mappingIntercept = Offset.zero;
   bool get _hasCalibration => _phase == TrackerPhase.tracking;
+  Offset? _smoothedRawEye;
 
   @override
   void initState() {
@@ -198,10 +203,11 @@ class _GazeTrackerState extends State<GazeTracker>
     final preview = _controller.value.previewSize!;
     final screen = MediaQuery.of(context).size;
     final raw = _normalizePoint(Offset(x / n, y / n), preview);
+    final stableRaw = _smoothRawEye(raw);
     if (_phase == TrackerPhase.calibrating) {
-      _handleCalibrationSample(raw, screen);
+      _handleCalibrationSample(stableRaw, screen);
     } else {
-      final mappedNorm = _applyMapping(raw);
+      final mappedNorm = _applyMapping(stableRaw);
       final mapped = Offset(
         mappedNorm.dx * screen.width,
         mappedNorm.dy * screen.height,
@@ -274,6 +280,41 @@ class _GazeTrackerState extends State<GazeTracker>
     return normalized;
   }
 
+  Offset _smoothRawEye(Offset raw) {
+    if (_smoothedRawEye == null) {
+      _smoothedRawEye = raw;
+      return raw;
+    }
+    final prev = _smoothedRawEye!;
+    final delta = (raw - prev).distance;
+    if (delta > _maxNormalizedJump) {
+      final scale = _maxNormalizedJump / delta;
+      raw = prev + (raw - prev) * scale;
+    }
+    final smoothed = Offset(
+      prev.dx + (raw.dx - prev.dx) * _emaWeight,
+      prev.dy + (raw.dy - prev.dy) * _emaWeight,
+    );
+    if (_frameCounter % _logEveryNFrames == 0) {
+      debugPrint('Smoothed eye raw $raw -> $smoothed');
+    }
+    _smoothedRawEye = smoothed;
+    return smoothed;
+  }
+
+  Offset _medianOffset(List<Offset> samples) {
+    double median(List<double> values) {
+      values.sort();
+      final mid = values.length ~/ 2;
+      if (values.length.isOdd) return values[mid];
+      return (values[mid - 1] + values[mid]) / 2.0;
+    }
+
+    final xs = samples.map((e) => e.dx).toList();
+    final ys = samples.map((e) => e.dy).toList();
+    return Offset(median(xs), median(ys));
+  }
+
   void _handleCalibrationSample(Offset rawEye, Size screen) {
     if (!_isCollecting) return;
     final currentSamples = _calibrationSamples[_calibrationIndex];
@@ -308,6 +349,7 @@ class _GazeTrackerState extends State<GazeTracker>
 
   void _finalizeCalibration() {
     _calibrationTimer?.cancel();
+    _collectDelayTimer?.cancel();
     _isCollecting = false;
     debugPrint('Finalizing calibration with collected samples...');
     final List<Offset> eyeMeans = [];
@@ -318,8 +360,7 @@ class _GazeTrackerState extends State<GazeTracker>
             'No samples collected for target ${i + 1}; falling back to target position');
         eyeMeans.add(_calibrationTargets[i]);
       } else {
-        final total = samples.reduce((a, b) => a + b);
-        eyeMeans.add(total / samples.length.toDouble());
+        eyeMeans.add(_medianOffset(samples));
       }
     }
 
@@ -379,12 +420,17 @@ class _GazeTrackerState extends State<GazeTracker>
       _finalizeCalibration();
       return;
     }
-    _isCollecting = true;
+    _isCollecting = false;
     _calibrationSamples[_calibrationIndex].clear();
     _displayTargetIndex = _calibrationIndex;
     _placeDotAtTarget(_displayTargetIndex);
     debugPrint(
         'Starting target ${_calibrationIndex + 1}/${_calibrationTargets.length} with ${_dwellDuration.inSeconds}s dwell');
+    _collectDelayTimer?.cancel();
+    _collectDelayTimer = Timer(_settleDuration, () {
+      _isCollecting = true;
+      debugPrint('Begin sampling target ${_calibrationIndex + 1} after settle');
+    });
     _calibrationTimer?.cancel();
     _calibrationTimer = Timer(_dwellDuration, _startTransitionWindow);
     setState(() {});
@@ -418,6 +464,7 @@ class _GazeTrackerState extends State<GazeTracker>
     _controller.dispose();
     _detector.close();
     _blink.dispose();
+    _collectDelayTimer?.cancel();
     _calibrationTimer?.cancel();
     super.dispose();
   }
