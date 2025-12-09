@@ -1,4 +1,6 @@
 import 'dart:async';
+import 'dart:typed_data';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:camera/camera.dart';
@@ -41,10 +43,11 @@ class _GazeTrackerState extends State<GazeTracker>
   late FaceDetector _detector;
   bool _ready = false;
   bool _tracking = false;
+  bool _processing = false;
+  late int _sensorOrientation;
   Offset _dot = Offset.zero;
   final List<Offset> _history = [];
   static const int _maxHistory = 6;
-  Timer? _frameT;
   late final AnimationController _blink;
   late final Animation<double> _blinkOp;
 
@@ -61,10 +64,13 @@ class _GazeTrackerState extends State<GazeTracker>
 
   Future<void> _init() async {
     debugPrint('Initializing camera controller...');
+    _sensorOrientation = widget.camera.sensorOrientation;
+    debugPrint('Sensor orientation: $_sensorOrientation');
     _controller = CameraController(
       widget.camera,
-      ResolutionPreset.low,
+      ResolutionPreset.medium,
       enableAudio: false,
+      imageFormatGroup: ImageFormatGroup.yuv420,
     );
     await _controller.initialize();
     debugPrint('Camera initialized with preview size: '
@@ -86,23 +92,54 @@ class _GazeTrackerState extends State<GazeTracker>
   void _startTracking() {
     if (_tracking || !_controller.value.isInitialized) return;
     setState(() => _tracking = true);
-    _frameT = Timer.periodic(const Duration(milliseconds: 250), (_) async {
-      if (!_controller.value.isInitialized || _controller.value.isTakingPicture) {
-        return;
-      }
+    debugPrint('Starting image stream for face detection...');
+    _controller.startImageStream((image) async {
+      if (_processing || !_controller.value.isStreamingImages) return;
+      _processing = true;
       try {
-        final pic = await _controller.takePicture();
-        debugPrint('Captured frame at: ${pic.path}');
-        await _analyze(pic.path);
+        final inputImage = _inputImageFromCameraImage(image);
+        await _analyze(inputImage);
       } catch (e) {
-        debugPrint('Frame capture failed: $e');
+        debugPrint('Frame analysis failed: $e');
+      } finally {
+        _processing = false;
       }
     });
   }
 
-  Future<void> _analyze(String path) async {
-    debugPrint('Analyzing frame: $path');
-    final img = InputImage.fromFilePath(path);
+  InputImage _inputImageFromCameraImage(CameraImage image) {
+    final rotation = InputImageRotationValue.fromRawValue(
+          widget.camera.sensorOrientation,
+        ) ??
+        InputImageRotation.rotation0deg;
+    final format = InputImageFormatValue.fromRawValue(image.format.raw) ??
+        InputImageFormat.nv21;
+    final bytes = WriteBuffer();
+    for (final plane in image.planes) {
+      bytes.putUint8List(plane.bytes);
+    }
+    final data = bytes.done().buffer.asUint8List();
+    return InputImage.fromBytes(
+      bytes: data,
+      inputImageData: InputImageData(
+        size: Size(image.width.toDouble(), image.height.toDouble()),
+        imageRotation: rotation,
+        inputImageFormat: format,
+        planeData: image.planes
+            .map(
+              (p) => InputImagePlaneMetadata(
+                bytesPerRow: p.bytesPerRow,
+                height: p.height,
+                width: p.width,
+              ),
+            )
+            .toList(),
+      ),
+    );
+  }
+
+  Future<void> _analyze(InputImage img) async {
+    debugPrint('Analyzing streaming frame...');
     final faces = await _detector.processImage(img);
     debugPrint('Faces detected: ${faces.length}');
     if (faces.isEmpty || !_controller.value.isInitialized) return;
@@ -130,10 +167,10 @@ class _GazeTrackerState extends State<GazeTracker>
 
     final preview = _controller.value.previewSize!;
     final screen = MediaQuery.of(context).size;
-    final raw = Offset(x / n, y / n);
+    final raw = _normalizePoint(Offset(x / n, y / n), preview);
     final mapped = Offset(
-      (raw.dx / preview.width) * screen.width,
-      (raw.dy / preview.height) * screen.height,
+      raw.dx * screen.width,
+      raw.dy * screen.height,
     );
 
     debugPrint('Raw eye avg: $raw | Mapped to screen: $mapped');
@@ -154,12 +191,51 @@ class _GazeTrackerState extends State<GazeTracker>
     }
   }
 
+  Offset _normalizePoint(Offset p, Size imageSize) {
+    double x = p.dx;
+    double y = p.dy;
+    double targetW = imageSize.width;
+    double targetH = imageSize.height;
+
+    switch (_sensorOrientation) {
+      case 90:
+        x = p.dy;
+        y = imageSize.width - p.dx;
+        targetW = imageSize.height;
+        targetH = imageSize.width;
+        break;
+      case 180:
+        x = imageSize.width - p.dx;
+        y = imageSize.height - p.dy;
+        break;
+      case 270:
+        x = imageSize.height - p.dy;
+        y = p.dx;
+        targetW = imageSize.height;
+        targetH = imageSize.width;
+        break;
+      default:
+        break;
+    }
+
+    if (widget.camera.lensDirection == CameraLensDirection.front) {
+      x = targetW - x;
+    }
+
+    final normalized = Offset(
+      (x / targetW).clamp(0.0, 1.0),
+      (y / targetH).clamp(0.0, 1.0),
+    );
+
+    debugPrint('Normalized eye point $p to $normalized using size $imageSize');
+    return normalized;
+  }
+
   @override
   void dispose() {
     _controller.dispose();
     _detector.close();
     _blink.dispose();
-    _frameT?.cancel();
     super.dispose();
   }
 
