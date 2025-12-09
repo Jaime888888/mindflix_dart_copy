@@ -1,4 +1,6 @@
 import 'dart:async';
+import 'dart:typed_data';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:camera/camera.dart';
@@ -7,8 +9,7 @@ import 'package:google_mlkit_face_detection/google_mlkit_face_detection.dart';
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await SystemChrome.setPreferredOrientations([
-    DeviceOrientation.landscapeLeft,
-    DeviceOrientation.landscapeRight,
+    DeviceOrientation.portraitUp,
   ]);
   final cameras = await availableCameras();
   final front = cameras.firstWhere(
@@ -29,6 +30,8 @@ class MyApp extends StatelessWidget {
   );
 }
 
+enum TrackerPhase { calibrating, tracking }
+
 class GazeTracker extends StatefulWidget {
   final CameraDescription camera;
   const GazeTracker({super.key, required this.camera});
@@ -40,17 +43,44 @@ class _GazeTrackerState extends State<GazeTracker>
     with SingleTickerProviderStateMixin {
   late CameraController _controller;
   late FaceDetector _detector;
-  bool _ready = false,
-      _running = false,
-      _calibrating = false,
-      _calibrated = false;
-  bool _flipX = false, _flipY = true;
-  double _dotX = 0, _dotY = 0, _calibX = 0, _calibY = 0;
-  int _left = 0, _right = 0, _secs = 10;
-  Timer? _frameT, _countT;
-  double _xSens = 10.0, _ySens = 8.0; // amplified default
+  bool _ready = false;
+  bool _tracking = false;
+  bool _processing = false;
+  late int _sensorOrientation;
+  Offset _dot = Offset.zero;
+  final List<Offset> _history = [];
+  static const int _maxHistory = 6;
+  static const int _logEveryNFrames = 90;
+  static const double _maxNormalizedJump = 0.2;
+  static const double _emaWeight = 0.35;
+  int _frameCounter = 0;
   late final AnimationController _blink;
   late final Animation<double> _blinkOp;
+  TrackerPhase _phase = TrackerPhase.calibrating;
+  final List<Offset> _calibrationTargets = const [
+    Offset(0.1, 0.1),
+    Offset(0.5, 0.1),
+    Offset(0.9, 0.1),
+    Offset(0.9, 0.5),
+    Offset(0.9, 0.9),
+    Offset(0.5, 0.9),
+    Offset(0.1, 0.9),
+    Offset(0.1, 0.5),
+    Offset(0.5, 0.5),
+  ];
+  late final List<List<Offset>> _calibrationSamples;
+  int _calibrationIndex = 0;
+  int _displayTargetIndex = 0;
+  bool _isCollecting = false;
+  Timer? _collectDelayTimer;
+  Timer? _calibrationTimer;
+  static const Duration _dwellDuration = Duration(seconds: 4);
+  static const Duration _travelDuration = Duration(seconds: 1);
+  static const Duration _settleDuration = Duration(seconds: 1);
+  Offset _mappingSlope = const Offset(1, 1);
+  Offset _mappingIntercept = Offset.zero;
+  bool get _hasCalibration => _phase == TrackerPhase.tracking;
+  Offset? _smoothedRawEye;
 
   @override
   void initState() {
@@ -60,117 +90,91 @@ class _GazeTrackerState extends State<GazeTracker>
       duration: const Duration(milliseconds: 800),
     )..repeat(reverse: true);
     _blinkOp = Tween(begin: 0.3, end: 1.0).animate(_blink);
+    _calibrationSamples =
+        List.generate(_calibrationTargets.length, (_) => <Offset>[]);
     _init();
   }
 
   Future<void> _init() async {
+    debugPrint('Initializing camera controller...');
+    _sensorOrientation = widget.camera.sensorOrientation;
+    debugPrint('Sensor orientation: $_sensorOrientation');
     _controller = CameraController(
       widget.camera,
-      ResolutionPreset.low,
+      ResolutionPreset.medium,
       enableAudio: false,
+      imageFormatGroup: ImageFormatGroup.yuv420,
     );
     await _controller.initialize();
+    debugPrint('Camera initialized with preview size: '
+        '${_controller.value.previewSize}');
     await _controller.setFlashMode(FlashMode.off);
+    debugPrint('Flash mode set to off');
     _detector = FaceDetector(
       options: FaceDetectorOptions(
         enableLandmarks: true,
         performanceMode: FaceDetectorMode.fast,
       ),
     );
+    debugPrint('Face detector created with landmarks enabled');
     setState(() => _ready = true);
+    debugPrint('Gaze tracker ready, starting tracking loop');
+    _startTracking();
   }
 
-  Future<Offset?> _eyePos() async {
-    try {
-      final pic = await _controller.takePicture();
-      final img = InputImage.fromFilePath(pic.path);
-      final faces = await _detector.processImage(img);
-      if (faces.isEmpty) return null;
-      double x = 0, y = 0;
-      int n = 0;
-      for (var f in faces) {
-        final l = f.landmarks[FaceLandmarkType.leftEye];
-        final r = f.landmarks[FaceLandmarkType.rightEye];
-        if (l != null && r != null) {
-          x += (l.position.x + r.position.x) / 2;
-          y += (l.position.y + r.position.y) / 2;
-          n++;
-        }
-      }
-      return n == 0 ? null : Offset(x / n, y / n);
-    } catch (_) {
-      return null;
-    }
-  }
-
-  Future<void> _calibrate() async {
-    if (_running || _calibrating) return;
-    setState(() => _calibrating = true);
-    final s = MediaQuery.of(context).size;
-    final pts = [
-      Offset(s.width * .1, s.height * .1),
-      Offset(s.width * .9, s.height * .1),
-      Offset(s.width * .1, s.height * .9),
-      Offset(s.width * .9, s.height * .9),
-      Offset(s.width * .5, s.height * .5),
-    ];
-    double tx = 0, ty = 0;
-    int n = 0;
-    for (var p in pts) {
-      setState(() {
-        _dotX = p.dx;
-        _dotY = p.dy;
-      });
-      for (int i = 0; i < 4; i++) {
-        await Future.delayed(const Duration(milliseconds: 500));
-        final e = await _eyePos();
-        if (e != null) {
-          tx += e.dx;
-          ty += e.dy;
-          n++;
-        }
-      }
-    }
-    if (n > 0) {
-      _calibX = tx / n;
-      _calibY = ty / n;
-      _calibrated = true;
-      _show("✅ Calibration Complete", "You can start the test now.");
-    } else {
-      _show("⚠️ Calibration Failed", "Please retry.");
-    }
-    setState(() => _calibrating = false);
-  }
-
-  void _start() {
-    if (!_calibrated) return _snack("Please calibrate first!");
-    if (_running) return;
-    setState(() {
-      _running = true;
-      _secs = 10;
-      _left = 0;
-      _right = 0;
-    });
-    _countT = Timer.periodic(const Duration(seconds: 1), (t) {
-      setState(() => _secs--);
-      if (_secs <= 0) {
-        t.cancel();
-        _stop();
+  void _startTracking() {
+    if (_tracking || !_controller.value.isInitialized) return;
+    setState(() => _tracking = true);
+    debugPrint('Starting image stream for face detection...');
+    _beginCalibrationRun();
+    _controller.startImageStream((image) async {
+      if (_processing || !_controller.value.isStreamingImages) return;
+      _processing = true;
+      try {
+        final inputImage = _inputImageFromCameraImage(image);
+        await _analyze(inputImage);
+      } catch (e) {
+        debugPrint('Frame analysis failed: $e');
+      } finally {
+        _processing = false;
       }
     });
-    _frameT = Timer.periodic(const Duration(milliseconds: 500), (_) async {
-      if (!_controller.value.isInitialized || _controller.value.isTakingPicture)
-        return;
-      final pic = await _controller.takePicture();
-      await _analyze(pic.path);
-    });
   }
 
-  Future<void> _analyze(String path) async {
-    final img = InputImage.fromFilePath(path);
+  InputImage _inputImageFromCameraImage(CameraImage image) {
+    final rotation = InputImageRotationValue.fromRawValue(
+          widget.camera.sensorOrientation,
+        ) ??
+        InputImageRotation.rotation0deg;
+    final format = InputImageFormatValue.fromRawValue(image.format.raw) ??
+        InputImageFormat.nv21;
+    final bytes = WriteBuffer();
+    for (final plane in image.planes) {
+      bytes.putUint8List(plane.bytes);
+    }
+    final data = bytes.done().buffer.asUint8List();
+    return InputImage.fromBytes(
+      bytes: data,
+      metadata: InputImageMetadata(
+        size: Size(image.width.toDouble(), image.height.toDouble()),
+        rotation: rotation,
+        format: format,
+        bytesPerRow: image.planes.first.bytesPerRow,
+      ),
+    );
+  }
+
+  Future<void> _analyze(InputImage img) async {
+    _frameCounter++;
+    if (_frameCounter % _logEveryNFrames == 0) {
+      debugPrint('Analyzing streaming frame...');
+    }
     final faces = await _detector.processImage(img);
-    if (faces.isEmpty) return;
-    final s = MediaQuery.of(context).size;
+    if (_frameCounter % _logEveryNFrames == 0) {
+      debugPrint('Faces detected: ${faces.length}');
+    }
+    if (faces.isEmpty || !_controller.value.isInitialized) return;
+
     double x = 0, y = 0;
     int n = 0;
     for (var f in faces) {
@@ -180,68 +184,286 @@ class _GazeTrackerState extends State<GazeTracker>
         x += (l.position.x + r.position.x) / 2;
         y += (l.position.y + r.position.y) / 2;
         n++;
+      } else {
+        if (_frameCounter % _logEveryNFrames == 0) {
+          debugPrint(
+              'Face ${faces.indexOf(f)} missing eye landmarks (left: $l, right: $r)');
+        }
       }
     }
-    if (n == 0) return;
-    x /= n;
-    y /= n;
-    final p = _controller.value.previewSize!;
-    double nx = _flipX ? (1 - x / p.width) * s.width : (x / p.width) * s.width;
-    double ny = _flipY
-        ? (1 - y / p.height) * s.height
-        : (y / p.height) * s.height;
-    double dx =
-        ((nx - s.width / 2) - ((_calibX / p.width - .5) * s.width)) * _xSens +
-        s.width / 2;
-    double dy =
-        ((ny - s.height / 2) - ((_calibY / p.height - .5) * s.height)) *
-            _ySens +
-        s.height / 2;
+    if (n == 0) {
+      if (_frameCounter % _logEveryNFrames == 0) {
+        debugPrint('No eyes found in detected faces');
+      }
+      return;
+    }
+
+    final preview = _controller.value.previewSize!;
+    final screen = MediaQuery.of(context).size;
+    final raw = _normalizePoint(Offset(x / n, y / n), preview);
+    final stableRaw = _smoothRawEye(raw);
+    if (_phase == TrackerPhase.calibrating) {
+      _handleCalibrationSample(stableRaw, screen);
+    } else {
+      final mappedNorm = _applyMapping(stableRaw);
+      final mapped = Offset(
+        mappedNorm.dx * screen.width,
+        mappedNorm.dy * screen.height,
+      );
+
+      if (_frameCounter % _logEveryNFrames == 0) {
+        debugPrint('Raw eye avg: $raw | Mapped to screen: $mapped');
+      }
+
+      _history.add(mapped);
+      if (_history.length > _maxHistory) {
+        _history.removeAt(0);
+      }
+      final avg =
+          _history.reduce((a, b) => a + b) / _history.length.toDouble();
+      final clamped = Offset(
+        avg.dx.clamp(0, screen.width),
+        avg.dy.clamp(0, screen.height),
+      );
+
+      if (mounted) {
+        setState(() => _dot = clamped);
+        if (_frameCounter % _logEveryNFrames == 0) {
+          debugPrint(
+              'Updated dot position to $clamped with history ${_history.length}');
+        }
+      }
+    }
+  }
+
+  Offset _normalizePoint(Offset p, Size imageSize) {
+    double x = p.dx;
+    double y = p.dy;
+    double targetW = imageSize.width;
+    double targetH = imageSize.height;
+
+    switch (_sensorOrientation) {
+      case 90:
+        x = p.dy;
+        y = imageSize.width - p.dx;
+        targetW = imageSize.height;
+        targetH = imageSize.width;
+        break;
+      case 180:
+        x = imageSize.width - p.dx;
+        y = imageSize.height - p.dy;
+        break;
+      case 270:
+        x = imageSize.height - p.dy;
+        y = p.dx;
+        targetW = imageSize.height;
+        targetH = imageSize.width;
+        break;
+      default:
+        break;
+    }
+
+    if (widget.camera.lensDirection == CameraLensDirection.front) {
+      x = targetW - x;
+    }
+
+    final normalized = Offset(
+      (x / targetW).clamp(0.0, 1.0),
+      (y / targetH).clamp(0.0, 1.0),
+    );
+
+    if (_frameCounter % _logEveryNFrames == 0) {
+      debugPrint('Normalized eye point $p to $normalized using size $imageSize');
+    }
+    return normalized;
+  }
+
+  Offset _smoothRawEye(Offset raw) {
+    if (_smoothedRawEye == null) {
+      _smoothedRawEye = raw;
+      return raw;
+    }
+    final prev = _smoothedRawEye!;
+    final delta = (raw - prev).distance;
+    if (delta > _maxNormalizedJump) {
+      final scale = _maxNormalizedJump / delta;
+      raw = prev + (raw - prev) * scale;
+    }
+    final smoothed = Offset(
+      prev.dx + (raw.dx - prev.dx) * _emaWeight,
+      prev.dy + (raw.dy - prev.dy) * _emaWeight,
+    );
+    if (_frameCounter % _logEveryNFrames == 0) {
+      debugPrint('Smoothed eye raw $raw -> $smoothed');
+    }
+    _smoothedRawEye = smoothed;
+    return smoothed;
+  }
+
+  Offset _medianOffset(List<Offset> samples) {
+    double median(List<double> values) {
+      values.sort();
+      final mid = values.length ~/ 2;
+      if (values.length.isOdd) return values[mid];
+      return (values[mid - 1] + values[mid]) / 2.0;
+    }
+
+    final xs = samples.map((e) => e.dx).toList();
+    final ys = samples.map((e) => e.dy).toList();
+    return Offset(median(xs), median(ys));
+  }
+
+  void _handleCalibrationSample(Offset rawEye, Size screen) {
+    if (!_isCollecting) return;
+    final currentSamples = _calibrationSamples[_calibrationIndex];
+    currentSamples.add(rawEye);
+
+    if (currentSamples.length == 1) {
+      debugPrint(
+          'Collecting samples for target ${_calibrationIndex + 1}/${_calibrationTargets.length}');
+    }
+
+    _dot = Offset(
+      _calibrationTargets[_calibrationIndex].dx * screen.width,
+      _calibrationTargets[_calibrationIndex].dy * screen.height,
+    );
+
+    if (mounted && _frameCounter % _logEveryNFrames == 0) {
+      setState(() {});
+    }
+  }
+
+  Offset _applyMapping(Offset rawEye) {
+    if (!_hasCalibration) return rawEye;
+    final mapped = Offset(
+      _mappingSlope.dx * rawEye.dx + _mappingIntercept.dx,
+      _mappingSlope.dy * rawEye.dy + _mappingIntercept.dy,
+    );
+    return Offset(
+      mapped.dx.clamp(0.0, 1.0),
+      mapped.dy.clamp(0.0, 1.0),
+    );
+  }
+
+  void _finalizeCalibration() {
+    _calibrationTimer?.cancel();
+    _collectDelayTimer?.cancel();
+    _isCollecting = false;
+    debugPrint('Finalizing calibration with collected samples...');
+    final List<Offset> eyeMeans = [];
+    for (int i = 0; i < _calibrationSamples.length; i++) {
+      final samples = _calibrationSamples[i];
+      if (samples.isEmpty) {
+        debugPrint(
+            'No samples collected for target ${i + 1}; falling back to target position');
+        eyeMeans.add(_calibrationTargets[i]);
+      } else {
+        eyeMeans.add(_medianOffset(samples));
+      }
+    }
+
+    final targetMeans = _calibrationTargets;
+
+    double eyeMeanX = 0, eyeMeanY = 0, targetMeanX = 0, targetMeanY = 0;
+    for (int i = 0; i < eyeMeans.length; i++) {
+      eyeMeanX += eyeMeans[i].dx;
+      eyeMeanY += eyeMeans[i].dy;
+      targetMeanX += targetMeans[i].dx;
+      targetMeanY += targetMeans[i].dy;
+    }
+    eyeMeanX /= eyeMeans.length;
+    eyeMeanY /= eyeMeans.length;
+    targetMeanX /= targetMeans.length;
+    targetMeanY /= targetMeans.length;
+
+    double varEyeX = 0, varEyeY = 0, covX = 0, covY = 0;
+    for (int i = 0; i < eyeMeans.length; i++) {
+      final dxEye = eyeMeans[i].dx - eyeMeanX;
+      final dyEye = eyeMeans[i].dy - eyeMeanY;
+      varEyeX += dxEye * dxEye;
+      varEyeY += dyEye * dyEye;
+      covX += dxEye * (targetMeans[i].dx - targetMeanX);
+      covY += dyEye * (targetMeans[i].dy - targetMeanY);
+    }
+
+    varEyeX = varEyeX == 0 ? 1e-6 : varEyeX;
+    varEyeY = varEyeY == 0 ? 1e-6 : varEyeY;
+
+    final slopeX = covX / varEyeX;
+    final slopeY = covY / varEyeY;
+    final interceptX = targetMeanX - slopeX * eyeMeanX;
+    final interceptY = targetMeanY - slopeY * eyeMeanY;
+
     setState(() {
-      _dotX = dx.clamp(0, s.width);
-      _dotY = dy.clamp(0, s.height);
+      _mappingSlope = Offset(slopeX, slopeY);
+      _mappingIntercept = Offset(interceptX, interceptY);
+      _phase = TrackerPhase.tracking;
+      _history.clear();
     });
-    if (dx < s.width / 2)
-      _left++;
-    else
-      _right++;
+
+    debugPrint(
+        'Calibration complete. Slope: $_mappingSlope, Intercept: $_mappingIntercept');
   }
 
-  Future<void> _stop() async {
-    _frameT?.cancel();
-    _countT?.cancel();
-    setState(() => _running = false);
-    final res = _left > _right
-        ? "👁 Looked more at LEFT image"
-        : _right > _left
-        ? "👁 Looked more at RIGHT image"
-        : "🤷‍♂️ Looked equally at both";
-    _show("Test Result", "⏱ 10s\n👈 $_left left\n👉 $_right right\n\n$res");
+  void _beginCalibrationRun() {
+    _calibrationTimer?.cancel();
+    _calibrationIndex = 0;
+    _displayTargetIndex = 0;
+    _phase = TrackerPhase.calibrating;
+    _startTargetWindow();
   }
 
-  void _snack(String t) =>
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(t)));
-  void _show(String t, String m) => showDialog(
-    context: context,
-    builder: (_) => AlertDialog(
-      title: Text(t),
-      content: Text(m),
-      actions: [
-        TextButton(
-          onPressed: () => Navigator.pop(context),
-          child: const Text("OK"),
-        ),
-      ],
-    ),
-  );
+  void _startTargetWindow() {
+    if (_calibrationIndex >= _calibrationTargets.length) {
+      _finalizeCalibration();
+      return;
+    }
+    _isCollecting = false;
+    _calibrationSamples[_calibrationIndex].clear();
+    _displayTargetIndex = _calibrationIndex;
+    _placeDotAtTarget(_displayTargetIndex);
+    debugPrint(
+        'Starting target ${_calibrationIndex + 1}/${_calibrationTargets.length} with ${_dwellDuration.inSeconds}s dwell');
+    _collectDelayTimer?.cancel();
+    _collectDelayTimer = Timer(_settleDuration, () {
+      _isCollecting = true;
+      debugPrint('Begin sampling target ${_calibrationIndex + 1} after settle');
+    });
+    _calibrationTimer?.cancel();
+    _calibrationTimer = Timer(_dwellDuration, _startTransitionWindow);
+    setState(() {});
+  }
+
+  void _startTransitionWindow() {
+    _isCollecting = false;
+    debugPrint(
+        'Transitioning to next target over ${_travelDuration.inSeconds}s (samples paused)');
+    _calibrationTimer?.cancel();
+    _displayTargetIndex = (_calibrationIndex + 1)
+        .clamp(0, _calibrationTargets.length - 1);
+    _placeDotAtTarget(_displayTargetIndex);
+    _calibrationTimer = Timer(_travelDuration, () {
+      _calibrationIndex++;
+      _startTargetWindow();
+    });
+    setState(() {});
+  }
+
+  void _placeDotAtTarget(int index) {
+    final screen = MediaQuery.of(context).size;
+    _dot = Offset(
+      _calibrationTargets[index].dx * screen.width,
+      _calibrationTargets[index].dy * screen.height,
+    );
+  }
 
   @override
   void dispose() {
     _controller.dispose();
     _detector.close();
     _blink.dispose();
-    _frameT?.cancel();
-    _countT?.cancel();
+    _collectDelayTimer?.cancel();
+    _calibrationTimer?.cancel();
     super.dispose();
   }
 
@@ -249,33 +471,54 @@ class _GazeTrackerState extends State<GazeTracker>
   Widget build(BuildContext context) {
     if (!_ready)
       return const Scaffold(body: Center(child: CircularProgressIndicator()));
+    final size = MediaQuery.of(context).size;
+    final dotPos = _dot == Offset.zero ? Offset(size.width / 2, size.height / 2) : _dot;
     return Scaffold(
       body: Stack(
         children: [
-          Row(
-            children: [
-              Expanded(
-                child: Image.asset(
-                  'images/golden-retriever-tongue-out.jpg',
-                  fit: BoxFit.cover,
+          Container(color: Colors.black),
+          Positioned(
+            left: 16,
+            top: 16,
+            child: Row(
+              children: [
+                const Icon(Icons.visibility, color: Colors.white70),
+                const SizedBox(width: 8),
+                Text(
+                  _phase == TrackerPhase.calibrating
+                      ? "Calibrating (${_calibrationIndex + 1}/${_calibrationTargets.length})"
+                      : (_tracking ? "Tracking eyes" : "Starting camera..."),
+                  style: const TextStyle(color: Colors.white70),
+                ),
+              ],
+            ),
+          ),
+          if (_phase == TrackerPhase.calibrating)
+            Positioned(
+              left:
+                  _calibrationTargets[_displayTargetIndex].dx * size.width - 16,
+              top:
+                  _calibrationTargets[_displayTargetIndex].dy * size.height - 16,
+              child: Container(
+                width: 32,
+                height: 32,
+                decoration: BoxDecoration(
+                  shape: BoxShape.circle,
+                  border: Border.all(color: Colors.redAccent, width: 3),
                 ),
               ),
-              Expanded(
-                child: Image.asset('images/orange-cat.jpg', fit: BoxFit.cover),
-              ),
-            ],
-          ),
+            ),
           AnimatedPositioned(
-            duration: const Duration(milliseconds: 250),
-            left: _dotX - 10,
-            top: _dotY - 10,
+            duration: const Duration(milliseconds: 200),
+            left: dotPos.dx - 10,
+            top: dotPos.dy - 10,
             child: FadeTransition(
               opacity: _blinkOp,
               child: Container(
                 width: 20,
                 height: 20,
                 decoration: BoxDecoration(
-                  color: _calibrating ? Colors.orangeAccent : Colors.blueAccent,
+                  color: Colors.blueAccent,
                   shape: BoxShape.circle,
                   boxShadow: [
                     BoxShadow(
@@ -285,103 +528,6 @@ class _GazeTrackerState extends State<GazeTracker>
                     ),
                   ],
                 ),
-              ),
-            ),
-          ),
-          Align(
-            alignment: Alignment.bottomCenter,
-            child: Padding(
-              padding: const EdgeInsets.only(bottom: 30),
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Text(
-                    _calibrating
-                        ? "Calibrating..."
-                        : _running
-                        ? "Time left: $_secs s"
-                        : _calibrated
-                        ? "✅ Calibrated! Ready"
-                        : "Press Calibrate",
-                    style: const TextStyle(fontSize: 20),
-                  ),
-                  const SizedBox(height: 10),
-                  Row(
-                    mainAxisAlignment: MainAxisAlignment.center,
-                    children: [
-                      ElevatedButton(
-                        onPressed: _running || _calibrating ? null : _calibrate,
-                        style: ElevatedButton.styleFrom(
-                          backgroundColor: Colors.orange,
-                          padding: const EdgeInsets.symmetric(
-                            horizontal: 40,
-                            vertical: 18,
-                          ),
-                        ),
-                        child: const Text(
-                          "Calibrate",
-                          style: TextStyle(fontSize: 18),
-                        ),
-                      ),
-                      const SizedBox(width: 20),
-                      ElevatedButton(
-                        onPressed: _running || _calibrating ? null : _start,
-                        style: ElevatedButton.styleFrom(
-                          backgroundColor: Colors.green,
-                          padding: const EdgeInsets.symmetric(
-                            horizontal: 40,
-                            vertical: 18,
-                          ),
-                        ),
-                        child: const Text(
-                          "Start Test",
-                          style: TextStyle(fontSize: 18),
-                        ),
-                      ),
-                    ],
-                  ),
-                  const SizedBox(height: 12),
-                  Row(
-                    mainAxisAlignment: MainAxisAlignment.center,
-                    children: [
-                      const Text("Flip X"),
-                      Switch(
-                        value: _flipX,
-                        onChanged: (v) => setState(() => _flipX = v),
-                      ),
-                      const SizedBox(width: 30),
-                      const Text("Flip Y"),
-                      Switch(
-                        value: _flipY,
-                        onChanged: (v) => setState(() => _flipY = v),
-                      ),
-                    ],
-                  ),
-                  const SizedBox(height: 10),
-                  Row(
-                    mainAxisAlignment: MainAxisAlignment.center,
-                    children: [
-                      const Text("X Sensitivity"),
-                      Slider(
-                        value: _xSens,
-                        min: 2,
-                        max: 15,
-                        divisions: 13,
-                        label: _xSens.toStringAsFixed(1),
-                        onChanged: (v) => setState(() => _xSens = v),
-                      ),
-                      const Text("Y Sensitivity"),
-                      Slider(
-                        value: _ySens,
-                        min: 2,
-                        max: 15,
-                        divisions: 13,
-                        label: _ySens.toStringAsFixed(1),
-                        onChanged: (v) => setState(() => _ySens = v),
-                      ),
-                    ],
-                  ),
-                ],
               ),
             ),
           ),
