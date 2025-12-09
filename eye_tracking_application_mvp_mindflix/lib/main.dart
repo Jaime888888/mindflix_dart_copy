@@ -50,21 +50,29 @@ class _GazeTrackerState extends State<GazeTracker>
   Offset _dot = Offset.zero;
   final List<Offset> _history = [];
   static const int _maxHistory = 6;
-  static const int _logEveryNFrames = 12;
+  static const int _logEveryNFrames = 24;
   int _frameCounter = 0;
   late final AnimationController _blink;
   late final Animation<double> _blinkOp;
   TrackerPhase _phase = TrackerPhase.calibrating;
   final List<Offset> _calibrationTargets = const [
+    Offset(0.1, 0.1),
+    Offset(0.5, 0.1),
+    Offset(0.9, 0.1),
+    Offset(0.9, 0.5),
+    Offset(0.9, 0.9),
+    Offset(0.5, 0.9),
+    Offset(0.1, 0.9),
+    Offset(0.1, 0.5),
     Offset(0.5, 0.5),
-    Offset(0.15, 0.15),
-    Offset(0.85, 0.15),
-    Offset(0.85, 0.85),
-    Offset(0.15, 0.85),
   ];
   late final List<List<Offset>> _calibrationSamples;
-  final int _samplesPerTarget = 18;
   int _calibrationIndex = 0;
+  int _displayTargetIndex = 0;
+  bool _isCollecting = false;
+  Timer? _calibrationTimer;
+  static const Duration _dwellDuration = Duration(seconds: 4);
+  static const Duration _travelDuration = Duration(seconds: 1);
   Offset _mappingSlope = const Offset(1, 1);
   Offset _mappingIntercept = Offset.zero;
   bool get _hasCalibration => _phase == TrackerPhase.tracking;
@@ -113,6 +121,7 @@ class _GazeTrackerState extends State<GazeTracker>
     if (_tracking || !_controller.value.isInitialized) return;
     setState(() => _tracking = true);
     debugPrint('Starting image stream for face detection...');
+    _beginCalibrationRun();
     _controller.startImageStream((image) async {
       if (_processing || !_controller.value.isStreamingImages) return;
       _processing = true;
@@ -266,6 +275,7 @@ class _GazeTrackerState extends State<GazeTracker>
   }
 
   void _handleCalibrationSample(Offset rawEye, Size screen) {
+    if (!_isCollecting) return;
     final currentSamples = _calibrationSamples[_calibrationIndex];
     currentSamples.add(rawEye);
 
@@ -279,19 +289,8 @@ class _GazeTrackerState extends State<GazeTracker>
       _calibrationTargets[_calibrationIndex].dy * screen.height,
     );
 
-    if (currentSamples.length >= _samplesPerTarget) {
-      debugPrint(
-          'Completed target ${_calibrationIndex + 1}, computing next target');
-      if (_calibrationIndex < _calibrationTargets.length - 1) {
-        _calibrationIndex++;
-      } else {
-        _finalizeCalibration();
-      }
-      if (mounted) setState(() {});
-    } else {
-      if (mounted && _frameCounter % _logEveryNFrames == 0) {
-        setState(() {});
-      }
+    if (mounted && _frameCounter % _logEveryNFrames == 0) {
+      setState(() {});
     }
   }
 
@@ -308,11 +307,21 @@ class _GazeTrackerState extends State<GazeTracker>
   }
 
   void _finalizeCalibration() {
+    _calibrationTimer?.cancel();
+    _isCollecting = false;
     debugPrint('Finalizing calibration with collected samples...');
-    final List<Offset> eyeMeans = _calibrationSamples.map((samples) {
-      final total = samples.reduce((a, b) => a + b);
-      return total / samples.length.toDouble();
-    }).toList();
+    final List<Offset> eyeMeans = [];
+    for (int i = 0; i < _calibrationSamples.length; i++) {
+      final samples = _calibrationSamples[i];
+      if (samples.isEmpty) {
+        debugPrint(
+            'No samples collected for target ${i + 1}; falling back to target position');
+        eyeMeans.add(_calibrationTargets[i]);
+      } else {
+        final total = samples.reduce((a, b) => a + b);
+        eyeMeans.add(total / samples.length.toDouble());
+      }
+    }
 
     final targetMeans = _calibrationTargets;
 
@@ -346,13 +355,62 @@ class _GazeTrackerState extends State<GazeTracker>
     final interceptX = targetMeanX - slopeX * eyeMeanX;
     final interceptY = targetMeanY - slopeY * eyeMeanY;
 
-    _mappingSlope = Offset(slopeX, slopeY);
-    _mappingIntercept = Offset(interceptX, interceptY);
-    _phase = TrackerPhase.tracking;
-    _history.clear();
+    setState(() {
+      _mappingSlope = Offset(slopeX, slopeY);
+      _mappingIntercept = Offset(interceptX, interceptY);
+      _phase = TrackerPhase.tracking;
+      _history.clear();
+    });
 
     debugPrint(
         'Calibration complete. Slope: $_mappingSlope, Intercept: $_mappingIntercept');
+  }
+
+  void _beginCalibrationRun() {
+    _calibrationTimer?.cancel();
+    _calibrationIndex = 0;
+    _displayTargetIndex = 0;
+    _phase = TrackerPhase.calibrating;
+    _startTargetWindow();
+  }
+
+  void _startTargetWindow() {
+    if (_calibrationIndex >= _calibrationTargets.length) {
+      _finalizeCalibration();
+      return;
+    }
+    _isCollecting = true;
+    _calibrationSamples[_calibrationIndex].clear();
+    _displayTargetIndex = _calibrationIndex;
+    _placeDotAtTarget(_displayTargetIndex);
+    debugPrint(
+        'Starting target ${_calibrationIndex + 1}/${_calibrationTargets.length} with ${_dwellDuration.inSeconds}s dwell');
+    _calibrationTimer?.cancel();
+    _calibrationTimer = Timer(_dwellDuration, _startTransitionWindow);
+    setState(() {});
+  }
+
+  void _startTransitionWindow() {
+    _isCollecting = false;
+    debugPrint(
+        'Transitioning to next target over ${_travelDuration.inSeconds}s (samples paused)');
+    _calibrationTimer?.cancel();
+    _displayTargetIndex = (_calibrationIndex + 1)
+        .clamp(0, _calibrationTargets.length - 1);
+    _placeDotAtTarget(_displayTargetIndex);
+    _calibrationTimer = Timer(_travelDuration, () {
+      _calibrationIndex++;
+      _startTargetWindow();
+    });
+    setState(() {});
+  }
+
+  void _placeDotAtTarget(int index) {
+    final screen = MediaQuery.of(context).size;
+    _dot = Offset(
+      _calibrationTargets[index].dx * screen.width,
+      _calibrationTargets[index].dy * screen.height,
+    );
   }
 
   @override
@@ -360,6 +418,7 @@ class _GazeTrackerState extends State<GazeTracker>
     _controller.dispose();
     _detector.close();
     _blink.dispose();
+    _calibrationTimer?.cancel();
     super.dispose();
   }
 
@@ -391,8 +450,10 @@ class _GazeTrackerState extends State<GazeTracker>
           ),
           if (_phase == TrackerPhase.calibrating)
             Positioned(
-              left: _calibrationTargets[_calibrationIndex].dx * size.width - 16,
-              top: _calibrationTargets[_calibrationIndex].dy * size.height - 16,
+              left:
+                  _calibrationTargets[_displayTargetIndex].dx * size.width - 16,
+              top:
+                  _calibrationTargets[_displayTargetIndex].dy * size.height - 16,
               child: Container(
                 width: 32,
                 height: 32,
