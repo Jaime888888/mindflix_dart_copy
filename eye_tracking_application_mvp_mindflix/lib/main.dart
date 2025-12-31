@@ -52,6 +52,31 @@ class _GazeTrackerState extends State<GazeTracker>
 
   late final AnimationController _blink;
   late final Animation<double> _blinkOp;
+  TrackerPhase _phase = TrackerPhase.calibrating;
+  final List<Offset> _calibrationTargets = const [
+    Offset(0.1, 0.1),
+    Offset(0.5, 0.1),
+    Offset(0.9, 0.1),
+    Offset(0.9, 0.5),
+    Offset(0.9, 0.9),
+    Offset(0.5, 0.9),
+    Offset(0.1, 0.9),
+    Offset(0.1, 0.5),
+    Offset(0.5, 0.5),
+  ];
+  late final List<List<Offset>> _calibrationSamples;
+  int _calibrationIndex = 0;
+  int _displayTargetIndex = 0;
+  bool _isCollecting = false;
+  Timer? _collectDelayTimer;
+  Timer? _calibrationTimer;
+  static const Duration _dwellDuration = Duration(seconds: 4);
+  static const Duration _travelDuration = Duration(seconds: 1);
+  static const Duration _settleDuration = Duration(seconds: 1);
+  Offset _mappingSlope = const Offset(1, 1);
+  Offset _mappingIntercept = Offset.zero;
+  bool get _hasCalibration => _phase == TrackerPhase.tracking;
+  Offset? _smoothedRawEye;
 
   TrackerPhase _phase = TrackerPhase.calibrating;
   final List<Offset> _calibrationTargets = const [
