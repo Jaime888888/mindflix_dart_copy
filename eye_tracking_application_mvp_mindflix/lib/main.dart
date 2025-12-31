@@ -1,59 +1,55 @@
 import 'dart:async';
-import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:camera/camera.dart';
-import 'package:google_mlkit_face_detection/google_mlkit_face_detection.dart';
+import 'package:eye_tracking/eye_tracking.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await SystemChrome.setPreferredOrientations([
     DeviceOrientation.portraitUp,
   ]);
-  final cameras = await availableCameras();
-  final front = cameras.firstWhere(
-    (c) => c.lensDirection == CameraLensDirection.front,
-    orElse: () => cameras.first,
-  );
-  runApp(MyApp(camera: front));
+  runApp(const MyApp());
 }
 
 class MyApp extends StatelessWidget {
-  final CameraDescription camera;
-  const MyApp({super.key, required this.camera});
+  const MyApp({super.key});
+
   @override
   Widget build(BuildContext context) => MaterialApp(
     debugShowCheckedModeBanner: false,
     theme: ThemeData.dark(),
-    home: GazeTracker(camera: camera),
+    home: const GazeTracker(),
   );
 }
 
 enum TrackerPhase { calibrating, tracking }
 
 class GazeTracker extends StatefulWidget {
-  final CameraDescription camera;
-  const GazeTracker({super.key, required this.camera});
+  const GazeTracker({super.key});
+
   @override
   State<GazeTracker> createState() => _GazeTrackerState();
 }
 
 class _GazeTrackerState extends State<GazeTracker>
     with SingleTickerProviderStateMixin {
-  late CameraController _controller;
-  late FaceDetector _detector;
+  final EyeTracking _tracker = EyeTracking();
+  StreamSubscription<GazeData>? _subscription;
   bool _ready = false;
   bool _tracking = false;
-  bool _processing = false;
-  late int _sensorOrientation;
+  String? _errorMessage;
+
   Offset _dot = Offset.zero;
   final List<Offset> _history = [];
   static const int _maxHistory = 6;
-  static const int _logEveryNFrames = 90;
   static const double _maxNormalizedJump = 0.2;
   static const double _emaWeight = 0.35;
-  int _frameCounter = 0;
+
+  Offset? _smoothedRawGaze;
+  DateTime? _lastLogAt;
+  static const Duration _logInterval = Duration(seconds: 2);
+
   late final AnimationController _blink;
   late final Animation<double> _blinkOp;
   TrackerPhase _phase = TrackerPhase.calibrating;
@@ -82,6 +78,30 @@ class _GazeTrackerState extends State<GazeTracker>
   bool get _hasCalibration => _phase == TrackerPhase.tracking;
   Offset? _smoothedRawEye;
 
+  TrackerPhase _phase = TrackerPhase.calibrating;
+  final List<Offset> _calibrationTargets = const [
+    Offset(0.1, 0.1),
+    Offset(0.5, 0.1),
+    Offset(0.9, 0.1),
+    Offset(0.9, 0.5),
+    Offset(0.9, 0.9),
+    Offset(0.5, 0.9),
+    Offset(0.1, 0.9),
+    Offset(0.1, 0.5),
+    Offset(0.5, 0.5),
+  ];
+  late final List<List<Offset>> _calibrationSamples;
+  int _calibrationIndex = 0;
+  int _displayTargetIndex = 0;
+  bool _isCollecting = false;
+  Timer? _collectDelayTimer;
+  Timer? _calibrationTimer;
+  static const Duration _dwellDuration = Duration(seconds: 4);
+  static const Duration _travelDuration = Duration(seconds: 1);
+  static const Duration _settleDuration = Duration(seconds: 1);
+  Offset _mappingSlope = const Offset(1, 1);
+  Offset _mappingIntercept = Offset.zero;
+
   @override
   void initState() {
     super.initState();
@@ -96,196 +116,76 @@ class _GazeTrackerState extends State<GazeTracker>
   }
 
   Future<void> _init() async {
-    debugPrint('Initializing camera controller...');
-    _sensorOrientation = widget.camera.sensorOrientation;
-    debugPrint('Sensor orientation: $_sensorOrientation');
-    _controller = CameraController(
-      widget.camera,
-      ResolutionPreset.medium,
-      enableAudio: false,
-      imageFormatGroup: ImageFormatGroup.yuv420,
-    );
-    await _controller.initialize();
-    debugPrint('Camera initialized with preview size: '
-        '${_controller.value.previewSize}');
-    await _controller.setFlashMode(FlashMode.off);
-    debugPrint('Flash mode set to off');
-    _detector = FaceDetector(
-      options: FaceDetectorOptions(
-        enableLandmarks: true,
-        performanceMode: FaceDetectorMode.fast,
-      ),
-    );
-    debugPrint('Face detector created with landmarks enabled');
-    setState(() => _ready = true);
-    debugPrint('Gaze tracker ready, starting tracking loop');
-    _startTracking();
+    try {
+      _log('Initializing eye tracking...');
+      await _tracker.initialize();
+      final hasPermission = await _tracker.requestCameraPermission();
+      if (!hasPermission) {
+        throw Exception('Camera permission denied');
+      }
+      await _tracker.startTracking();
+      _log('Eye tracking started.');
+      _beginCalibrationRun();
+      _subscription = _tracker.getGazeStream().listen(_handleGaze);
+      setState(() {
+        _ready = true;
+        _tracking = true;
+      });
+    } catch (e) {
+      _log('Eye tracking init failed: $e');
+      setState(() {
+        _errorMessage = e.toString();
+        _ready = true;
+      });
+    }
   }
 
-  void _startTracking() {
-    if (_tracking || !_controller.value.isInitialized) return;
-    setState(() => _tracking = true);
-    debugPrint('Starting image stream for face detection...');
-    _beginCalibrationRun();
-    _controller.startImageStream((image) async {
-      if (_processing || !_controller.value.isStreamingImages) return;
-      _processing = true;
-      try {
-        final inputImage = _inputImageFromCameraImage(image);
-        await _analyze(inputImage);
-      } catch (e) {
-        debugPrint('Frame analysis failed: $e');
-      } finally {
-        _processing = false;
-      }
-    });
-  }
+  void _handleGaze(GazeData gaze) {
+    final screen = MediaQuery.of(context).size;
+    if (screen.width == 0 || screen.height == 0) return;
 
-  InputImage _inputImageFromCameraImage(CameraImage image) {
-    final rotation = InputImageRotationValue.fromRawValue(
-          widget.camera.sensorOrientation,
-        ) ??
-        InputImageRotation.rotation0deg;
-    final format = InputImageFormatValue.fromRawValue(image.format.raw) ??
-        InputImageFormat.nv21;
-    final bytes = WriteBuffer();
-    for (final plane in image.planes) {
-      bytes.putUint8List(plane.bytes);
-    }
-    final data = bytes.done().buffer.asUint8List();
-    return InputImage.fromBytes(
-      bytes: data,
-      metadata: InputImageMetadata(
-        size: Size(image.width.toDouble(), image.height.toDouble()),
-        rotation: rotation,
-        format: format,
-        bytesPerRow: image.planes.first.bytesPerRow,
-      ),
+    final raw = Offset(
+      (gaze.x / screen.width).clamp(0.0, 1.0),
+      (gaze.y / screen.height).clamp(0.0, 1.0),
     );
-  }
+    final stableRaw = _smoothRawGaze(raw);
 
-  Future<void> _analyze(InputImage img) async {
-    _frameCounter++;
-    if (_frameCounter % _logEveryNFrames == 0) {
-      debugPrint('Analyzing streaming frame...');
-    }
-    final faces = await _detector.processImage(img);
-    if (_frameCounter % _logEveryNFrames == 0) {
-      debugPrint('Faces detected: ${faces.length}');
-    }
-    if (faces.isEmpty || !_controller.value.isInitialized) return;
-
-    double x = 0, y = 0;
-    int n = 0;
-    for (var f in faces) {
-      final l = f.landmarks[FaceLandmarkType.leftEye];
-      final r = f.landmarks[FaceLandmarkType.rightEye];
-      if (l != null && r != null) {
-        debugPrint(
-            'Face ${faces.indexOf(f)} eye landmarks -> left: ${l.position}, right: ${r.position}');
-        x += (l.position.x + r.position.x) / 2;
-        y += (l.position.y + r.position.y) / 2;
-        n++;
-      } else {
-        if (_frameCounter % _logEveryNFrames == 0) {
-          debugPrint(
-              'Face ${faces.indexOf(f)} missing eye landmarks (left: $l, right: $r)');
-        }
-      }
-    }
-    if (n == 0) {
-      if (_frameCounter % _logEveryNFrames == 0) {
-        debugPrint('No eyes found in detected faces');
-      }
+    if (_phase == TrackerPhase.calibrating) {
+      _handleCalibrationSample(stableRaw, screen);
       return;
     }
 
-    final preview = _controller.value.previewSize!;
-    final screen = MediaQuery.of(context).size;
-    final raw = _normalizePoint(Offset(x / n, y / n), preview);
-    final stableRaw = _smoothRawEye(raw);
-    if (_phase == TrackerPhase.calibrating) {
-      _handleCalibrationSample(stableRaw, screen);
-    } else {
-      final mappedNorm = _applyMapping(stableRaw);
-      final mapped = Offset(
-        mappedNorm.dx * screen.width,
-        mappedNorm.dy * screen.height,
-      );
-
-      if (_frameCounter % _logEveryNFrames == 0) {
-        debugPrint('Raw eye avg: $raw | Mapped to screen: $mapped');
-      }
-
-      _history.add(mapped);
-      if (_history.length > _maxHistory) {
-        _history.removeAt(0);
-      }
-      final avg =
-          _history.reduce((a, b) => a + b) / _history.length.toDouble();
-      final clamped = Offset(
-        avg.dx.clamp(0, screen.width),
-        avg.dy.clamp(0, screen.height),
-      );
-
-      if (mounted) {
-        setState(() => _dot = clamped);
-        if (_frameCounter % _logEveryNFrames == 0) {
-          debugPrint(
-              'Updated dot position to $clamped with history ${_history.length}');
-        }
-      }
-    }
-  }
-
-  Offset _normalizePoint(Offset p, Size imageSize) {
-    double x = p.dx;
-    double y = p.dy;
-    double targetW = imageSize.width;
-    double targetH = imageSize.height;
-
-    switch (_sensorOrientation) {
-      case 90:
-        x = p.dy;
-        y = imageSize.width - p.dx;
-        targetW = imageSize.height;
-        targetH = imageSize.width;
-        break;
-      case 180:
-        x = imageSize.width - p.dx;
-        y = imageSize.height - p.dy;
-        break;
-      case 270:
-        x = imageSize.height - p.dy;
-        y = p.dx;
-        targetW = imageSize.height;
-        targetH = imageSize.width;
-        break;
-      default:
-        break;
-    }
-
-    if (widget.camera.lensDirection == CameraLensDirection.front) {
-      x = targetW - x;
-    }
-
-    final normalized = Offset(
-      (x / targetW).clamp(0.0, 1.0),
-      (y / targetH).clamp(0.0, 1.0),
+    final mappedNorm = _applyMapping(stableRaw);
+    final mapped = Offset(
+      mappedNorm.dx * screen.width,
+      mappedNorm.dy * screen.height,
     );
 
-    if (_frameCounter % _logEveryNFrames == 0) {
-      debugPrint('Normalized eye point $p to $normalized using size $imageSize');
+    _history.add(mapped);
+    if (_history.length > _maxHistory) {
+      _history.removeAt(0);
     }
-    return normalized;
+    final avg = _history.reduce((a, b) => a + b) / _history.length.toDouble();
+    final clamped = Offset(
+      avg.dx.clamp(0, screen.width),
+      avg.dy.clamp(0, screen.height),
+    );
+
+    if (mounted) {
+      setState(() => _dot = clamped);
+    }
+
+    _log(
+      'Gaze raw: ${_formatOffset(raw)} | mapped: ${_formatOffset(mappedNorm)}',
+    );
   }
 
-  Offset _smoothRawEye(Offset raw) {
-    if (_smoothedRawEye == null) {
-      _smoothedRawEye = raw;
+  Offset _smoothRawGaze(Offset raw) {
+    if (_smoothedRawGaze == null) {
+      _smoothedRawGaze = raw;
       return raw;
     }
-    final prev = _smoothedRawEye!;
+    final prev = _smoothedRawGaze!;
     final delta = (raw - prev).distance;
     if (delta > _maxNormalizedJump) {
       final scale = _maxNormalizedJump / delta;
@@ -295,10 +195,7 @@ class _GazeTrackerState extends State<GazeTracker>
       prev.dx + (raw.dx - prev.dx) * _emaWeight,
       prev.dy + (raw.dy - prev.dy) * _emaWeight,
     );
-    if (_frameCounter % _logEveryNFrames == 0) {
-      debugPrint('Smoothed eye raw $raw -> $smoothed');
-    }
-    _smoothedRawEye = smoothed;
+    _smoothedRawGaze = smoothed;
     return smoothed;
   }
 
@@ -315,31 +212,28 @@ class _GazeTrackerState extends State<GazeTracker>
     return Offset(median(xs), median(ys));
   }
 
-  void _handleCalibrationSample(Offset rawEye, Size screen) {
+  void _handleCalibrationSample(Offset rawGaze, Size screen) {
     if (!_isCollecting) return;
     final currentSamples = _calibrationSamples[_calibrationIndex];
-    currentSamples.add(rawEye);
+    currentSamples.add(rawGaze);
 
     if (currentSamples.length == 1) {
-      debugPrint(
-          'Collecting samples for target ${_calibrationIndex + 1}/${_calibrationTargets.length}');
+      _log(
+        'Collecting samples for target ${_calibrationIndex + 1}/${_calibrationTargets.length}',
+      );
     }
 
     _dot = Offset(
       _calibrationTargets[_calibrationIndex].dx * screen.width,
       _calibrationTargets[_calibrationIndex].dy * screen.height,
     );
-
-    if (mounted && _frameCounter % _logEveryNFrames == 0) {
-      setState(() {});
-    }
   }
 
-  Offset _applyMapping(Offset rawEye) {
-    if (!_hasCalibration) return rawEye;
+  Offset _applyMapping(Offset rawGaze) {
+    if (_phase != TrackerPhase.tracking) return rawGaze;
     final mapped = Offset(
-      _mappingSlope.dx * rawEye.dx + _mappingIntercept.dx,
-      _mappingSlope.dy * rawEye.dy + _mappingIntercept.dy,
+      _mappingSlope.dx * rawGaze.dx + _mappingIntercept.dx,
+      _mappingSlope.dy * rawGaze.dy + _mappingIntercept.dy,
     );
     return Offset(
       mapped.dx.clamp(0.0, 1.0),
@@ -351,50 +245,48 @@ class _GazeTrackerState extends State<GazeTracker>
     _calibrationTimer?.cancel();
     _collectDelayTimer?.cancel();
     _isCollecting = false;
-    debugPrint('Finalizing calibration with collected samples...');
-    final List<Offset> eyeMeans = [];
+    _log('Finalizing calibration with collected samples...');
+    final List<Offset> gazeMeans = [];
     for (int i = 0; i < _calibrationSamples.length; i++) {
       final samples = _calibrationSamples[i];
       if (samples.isEmpty) {
-        debugPrint(
-            'No samples collected for target ${i + 1}; falling back to target position');
-        eyeMeans.add(_calibrationTargets[i]);
+        _log('No samples for target ${i + 1}, falling back to target location.');
+        gazeMeans.add(_calibrationTargets[i]);
       } else {
-        eyeMeans.add(_medianOffset(samples));
+        gazeMeans.add(_medianOffset(samples));
       }
     }
 
     final targetMeans = _calibrationTargets;
-
-    double eyeMeanX = 0, eyeMeanY = 0, targetMeanX = 0, targetMeanY = 0;
-    for (int i = 0; i < eyeMeans.length; i++) {
-      eyeMeanX += eyeMeans[i].dx;
-      eyeMeanY += eyeMeans[i].dy;
+    double gazeMeanX = 0, gazeMeanY = 0, targetMeanX = 0, targetMeanY = 0;
+    for (int i = 0; i < gazeMeans.length; i++) {
+      gazeMeanX += gazeMeans[i].dx;
+      gazeMeanY += gazeMeans[i].dy;
       targetMeanX += targetMeans[i].dx;
       targetMeanY += targetMeans[i].dy;
     }
-    eyeMeanX /= eyeMeans.length;
-    eyeMeanY /= eyeMeans.length;
+    gazeMeanX /= gazeMeans.length;
+    gazeMeanY /= gazeMeans.length;
     targetMeanX /= targetMeans.length;
     targetMeanY /= targetMeans.length;
 
-    double varEyeX = 0, varEyeY = 0, covX = 0, covY = 0;
-    for (int i = 0; i < eyeMeans.length; i++) {
-      final dxEye = eyeMeans[i].dx - eyeMeanX;
-      final dyEye = eyeMeans[i].dy - eyeMeanY;
-      varEyeX += dxEye * dxEye;
-      varEyeY += dyEye * dyEye;
-      covX += dxEye * (targetMeans[i].dx - targetMeanX);
-      covY += dyEye * (targetMeans[i].dy - targetMeanY);
+    double varGazeX = 0, varGazeY = 0, covX = 0, covY = 0;
+    for (int i = 0; i < gazeMeans.length; i++) {
+      final dxGaze = gazeMeans[i].dx - gazeMeanX;
+      final dyGaze = gazeMeans[i].dy - gazeMeanY;
+      varGazeX += dxGaze * dxGaze;
+      varGazeY += dyGaze * dyGaze;
+      covX += dxGaze * (targetMeans[i].dx - targetMeanX);
+      covY += dyGaze * (targetMeans[i].dy - targetMeanY);
     }
 
-    varEyeX = varEyeX == 0 ? 1e-6 : varEyeX;
-    varEyeY = varEyeY == 0 ? 1e-6 : varEyeY;
+    varGazeX = varGazeX == 0 ? 1e-6 : varGazeX;
+    varGazeY = varGazeY == 0 ? 1e-6 : varGazeY;
 
-    final slopeX = covX / varEyeX;
-    final slopeY = covY / varEyeY;
-    final interceptX = targetMeanX - slopeX * eyeMeanX;
-    final interceptY = targetMeanY - slopeY * eyeMeanY;
+    final slopeX = covX / varGazeX;
+    final slopeY = covY / varGazeY;
+    final interceptX = targetMeanX - slopeX * gazeMeanX;
+    final interceptY = targetMeanY - slopeY * gazeMeanY;
 
     setState(() {
       _mappingSlope = Offset(slopeX, slopeY);
@@ -403,8 +295,10 @@ class _GazeTrackerState extends State<GazeTracker>
       _history.clear();
     });
 
-    debugPrint(
-        'Calibration complete. Slope: $_mappingSlope, Intercept: $_mappingIntercept');
+    _log(
+      'Calibration complete. Slope: ${_formatOffset(_mappingSlope)}, '
+      'Intercept: ${_formatOffset(_mappingIntercept)}',
+    );
   }
 
   void _beginCalibrationRun() {
@@ -424,12 +318,14 @@ class _GazeTrackerState extends State<GazeTracker>
     _calibrationSamples[_calibrationIndex].clear();
     _displayTargetIndex = _calibrationIndex;
     _placeDotAtTarget(_displayTargetIndex);
-    debugPrint(
-        'Starting target ${_calibrationIndex + 1}/${_calibrationTargets.length} with ${_dwellDuration.inSeconds}s dwell');
+    _log(
+      'Target ${_calibrationIndex + 1}/${_calibrationTargets.length}: '
+      '${_dwellDuration.inSeconds}s dwell',
+    );
     _collectDelayTimer?.cancel();
     _collectDelayTimer = Timer(_settleDuration, () {
       _isCollecting = true;
-      debugPrint('Begin sampling target ${_calibrationIndex + 1} after settle');
+      _log('Sampling target ${_calibrationIndex + 1} after settle.');
     });
     _calibrationTimer?.cancel();
     _calibrationTimer = Timer(_dwellDuration, _startTransitionWindow);
@@ -438,8 +334,9 @@ class _GazeTrackerState extends State<GazeTracker>
 
   void _startTransitionWindow() {
     _isCollecting = false;
-    debugPrint(
-        'Transitioning to next target over ${_travelDuration.inSeconds}s (samples paused)');
+    _log(
+      'Transitioning to next target (${_travelDuration.inSeconds}s).',
+    );
     _calibrationTimer?.cancel();
     _displayTargetIndex = (_calibrationIndex + 1)
         .clamp(0, _calibrationTargets.length - 1);
@@ -459,10 +356,22 @@ class _GazeTrackerState extends State<GazeTracker>
     );
   }
 
+  void _log(String message) {
+    final now = DateTime.now();
+    if (_lastLogAt == null || now.difference(_lastLogAt!) >= _logInterval) {
+      debugPrint(message);
+      _lastLogAt = now;
+    }
+  }
+
+  String _formatOffset(Offset offset) =>
+      '(${offset.dx.toStringAsFixed(2)}, ${offset.dy.toStringAsFixed(2)})';
+
   @override
   void dispose() {
-    _controller.dispose();
-    _detector.close();
+    _subscription?.cancel();
+    _tracker.stopTracking();
+    _tracker.dispose();
     _blink.dispose();
     _collectDelayTimer?.cancel();
     _calibrationTimer?.cancel();
@@ -471,10 +380,31 @@ class _GazeTrackerState extends State<GazeTracker>
 
   @override
   Widget build(BuildContext context) {
-    if (!_ready)
-      return const Scaffold(body: Center(child: CircularProgressIndicator()));
+    if (!_ready) {
+      return const Scaffold(
+        body: Center(child: CircularProgressIndicator()),
+      );
+    }
+
+    if (_errorMessage != null) {
+      return Scaffold(
+        body: Center(
+          child: Padding(
+            padding: const EdgeInsets.all(24),
+            child: Text(
+              _errorMessage!,
+              style: const TextStyle(color: Colors.redAccent),
+              textAlign: TextAlign.center,
+            ),
+          ),
+        ),
+      );
+    }
+
     final size = MediaQuery.of(context).size;
-    final dotPos = _dot == Offset.zero ? Offset(size.width / 2, size.height / 2) : _dot;
+    final dotPos =
+        _dot == Offset.zero ? Offset(size.width / 2, size.height / 2) : _dot;
+
     return Scaffold(
       body: Stack(
         children: [
@@ -488,8 +418,8 @@ class _GazeTrackerState extends State<GazeTracker>
                 const SizedBox(width: 8),
                 Text(
                   _phase == TrackerPhase.calibrating
-                      ? "Calibrating (${_calibrationIndex + 1}/${_calibrationTargets.length})"
-                      : (_tracking ? "Tracking eyes" : "Starting camera..."),
+                      ? 'Calibrating (${_calibrationIndex + 1}/${_calibrationTargets.length})'
+                      : (_tracking ? 'Tracking eyes' : 'Starting tracker...'),
                   style: const TextStyle(color: Colors.white70),
                 ),
               ],
@@ -497,10 +427,8 @@ class _GazeTrackerState extends State<GazeTracker>
           ),
           if (_phase == TrackerPhase.calibrating)
             Positioned(
-              left:
-                  _calibrationTargets[_displayTargetIndex].dx * size.width - 16,
-              top:
-                  _calibrationTargets[_displayTargetIndex].dy * size.height - 16,
+              left: _calibrationTargets[_displayTargetIndex].dx * size.width - 16,
+              top: _calibrationTargets[_displayTargetIndex].dy * size.height - 16,
               child: Container(
                 width: 32,
                 height: 32,
