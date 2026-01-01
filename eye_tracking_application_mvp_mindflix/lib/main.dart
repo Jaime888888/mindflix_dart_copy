@@ -23,6 +23,8 @@ class MyApp extends StatelessWidget {
   );
 }
 
+enum TrackerPhase { calibrating, tracking }
+
 class GazeTracker extends StatefulWidget {
   const GazeTracker({super.key});
 
@@ -50,6 +52,55 @@ class _GazeTrackerState extends State<GazeTracker>
 
   late final AnimationController _blink;
   late final Animation<double> _blinkOp;
+  TrackerPhase _phase = TrackerPhase.calibrating;
+  final List<Offset> _calibrationTargets = const [
+    Offset(0.1, 0.1),
+    Offset(0.5, 0.1),
+    Offset(0.9, 0.1),
+    Offset(0.9, 0.5),
+    Offset(0.9, 0.9),
+    Offset(0.5, 0.9),
+    Offset(0.1, 0.9),
+    Offset(0.1, 0.5),
+    Offset(0.5, 0.5),
+  ];
+  late final List<List<Offset>> _calibrationSamples;
+  int _calibrationIndex = 0;
+  int _displayTargetIndex = 0;
+  bool _isCollecting = false;
+  Timer? _collectDelayTimer;
+  Timer? _calibrationTimer;
+  static const Duration _dwellDuration = Duration(seconds: 4);
+  static const Duration _travelDuration = Duration(seconds: 1);
+  static const Duration _settleDuration = Duration(seconds: 1);
+  Offset _mappingSlope = const Offset(1, 1);
+  Offset _mappingIntercept = Offset.zero;
+  bool get _hasCalibration => _phase == TrackerPhase.tracking;
+  Offset? _smoothedRawEye;
+
+  TrackerPhase _phase = TrackerPhase.calibrating;
+  final List<Offset> _calibrationTargets = const [
+    Offset(0.1, 0.1),
+    Offset(0.5, 0.1),
+    Offset(0.9, 0.1),
+    Offset(0.9, 0.5),
+    Offset(0.9, 0.9),
+    Offset(0.5, 0.9),
+    Offset(0.1, 0.9),
+    Offset(0.1, 0.5),
+    Offset(0.5, 0.5),
+  ];
+  late final List<List<Offset>> _calibrationSamples;
+  int _calibrationIndex = 0;
+  int _displayTargetIndex = 0;
+  bool _isCollecting = false;
+  Timer? _collectDelayTimer;
+  Timer? _calibrationTimer;
+  static const Duration _dwellDuration = Duration(seconds: 4);
+  static const Duration _travelDuration = Duration(seconds: 1);
+  static const Duration _settleDuration = Duration(seconds: 1);
+  Offset _mappingSlope = const Offset(1, 1);
+  Offset _mappingIntercept = Offset.zero;
 
   @override
   void initState() {
@@ -59,6 +110,8 @@ class _GazeTrackerState extends State<GazeTracker>
       duration: const Duration(milliseconds: 800),
     )..repeat(reverse: true);
     _blinkOp = Tween(begin: 0.3, end: 1.0).animate(_blink);
+    _calibrationSamples =
+        List.generate(_calibrationTargets.length, (_) => <Offset>[]);
     _init();
   }
 
@@ -84,6 +137,12 @@ class _GazeTrackerState extends State<GazeTracker>
         _ready = true;
       });
     }
+    final smoothed = Offset(
+      prev.dx + (raw.dx - prev.dx) * _emaWeight,
+      prev.dy + (raw.dy - prev.dy) * _emaWeight,
+    );
+    _smoothedRawGaze = smoothed;
+    return smoothed;
   }
 
   void _handleGaze(GazeData gaze) {
@@ -201,6 +260,19 @@ class _GazeTrackerState extends State<GazeTracker>
               ],
             ),
           ),
+          if (_phase == TrackerPhase.calibrating)
+            Positioned(
+              left: _calibrationTargets[_displayTargetIndex].dx * size.width - 16,
+              top: _calibrationTargets[_displayTargetIndex].dy * size.height - 16,
+              child: Container(
+                width: 32,
+                height: 32,
+                decoration: BoxDecoration(
+                  shape: BoxShape.circle,
+                  border: Border.all(color: Colors.redAccent, width: 3),
+                ),
+              ),
+            ),
           AnimatedPositioned(
             duration: const Duration(milliseconds: 200),
             left: dotPos.dx - 10,
