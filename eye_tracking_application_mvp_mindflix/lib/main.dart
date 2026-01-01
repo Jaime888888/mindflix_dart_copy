@@ -1,8 +1,8 @@
 import 'dart:async';
 
+import 'package:eye_tracking/eye_tracking.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:eye_tracking/eye_tracking.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -125,7 +125,6 @@ class _GazeTrackerState extends State<GazeTracker>
       }
       await _tracker.startTracking();
       _log('Eye tracking started.');
-      _beginCalibrationRun();
       _subscription = _tracker.getGazeStream().listen(_handleGaze);
       setState(() {
         _ready = true;
@@ -138,6 +137,12 @@ class _GazeTrackerState extends State<GazeTracker>
         _ready = true;
       });
     }
+    final smoothed = Offset(
+      prev.dx + (raw.dx - prev.dx) * _emaWeight,
+      prev.dy + (raw.dy - prev.dy) * _emaWeight,
+    );
+    _smoothedRawGaze = smoothed;
+    return smoothed;
   }
 
   void _handleGaze(GazeData gaze) {
@@ -149,16 +154,9 @@ class _GazeTrackerState extends State<GazeTracker>
       (gaze.y / screen.height).clamp(0.0, 1.0),
     );
     final stableRaw = _smoothRawGaze(raw);
-
-    if (_phase == TrackerPhase.calibrating) {
-      _handleCalibrationSample(stableRaw, screen);
-      return;
-    }
-
-    final mappedNorm = _applyMapping(stableRaw);
     final mapped = Offset(
-      mappedNorm.dx * screen.width,
-      mappedNorm.dy * screen.height,
+      stableRaw.dx * screen.width,
+      stableRaw.dy * screen.height,
     );
 
     _history.add(mapped);
@@ -175,9 +173,7 @@ class _GazeTrackerState extends State<GazeTracker>
       setState(() => _dot = clamped);
     }
 
-    _log(
-      'Gaze raw: ${_formatOffset(raw)} | mapped: ${_formatOffset(mappedNorm)}',
-    );
+    _log('Gaze: ${_formatOffset(raw)}');
   }
 
   Offset _smoothRawGaze(Offset raw) {
@@ -199,163 +195,6 @@ class _GazeTrackerState extends State<GazeTracker>
     return smoothed;
   }
 
-  Offset _medianOffset(List<Offset> samples) {
-    double median(List<double> values) {
-      values.sort();
-      final mid = values.length ~/ 2;
-      if (values.length.isOdd) return values[mid];
-      return (values[mid - 1] + values[mid]) / 2.0;
-    }
-
-    final xs = samples.map((e) => e.dx).toList();
-    final ys = samples.map((e) => e.dy).toList();
-    return Offset(median(xs), median(ys));
-  }
-
-  void _handleCalibrationSample(Offset rawGaze, Size screen) {
-    if (!_isCollecting) return;
-    final currentSamples = _calibrationSamples[_calibrationIndex];
-    currentSamples.add(rawGaze);
-
-    if (currentSamples.length == 1) {
-      _log(
-        'Collecting samples for target ${_calibrationIndex + 1}/${_calibrationTargets.length}',
-      );
-    }
-
-    _dot = Offset(
-      _calibrationTargets[_calibrationIndex].dx * screen.width,
-      _calibrationTargets[_calibrationIndex].dy * screen.height,
-    );
-  }
-
-  Offset _applyMapping(Offset rawGaze) {
-    if (_phase != TrackerPhase.tracking) return rawGaze;
-    final mapped = Offset(
-      _mappingSlope.dx * rawGaze.dx + _mappingIntercept.dx,
-      _mappingSlope.dy * rawGaze.dy + _mappingIntercept.dy,
-    );
-    return Offset(
-      mapped.dx.clamp(0.0, 1.0),
-      mapped.dy.clamp(0.0, 1.0),
-    );
-  }
-
-  void _finalizeCalibration() {
-    _calibrationTimer?.cancel();
-    _collectDelayTimer?.cancel();
-    _isCollecting = false;
-    _log('Finalizing calibration with collected samples...');
-    final List<Offset> gazeMeans = [];
-    for (int i = 0; i < _calibrationSamples.length; i++) {
-      final samples = _calibrationSamples[i];
-      if (samples.isEmpty) {
-        _log('No samples for target ${i + 1}, falling back to target location.');
-        gazeMeans.add(_calibrationTargets[i]);
-      } else {
-        gazeMeans.add(_medianOffset(samples));
-      }
-    }
-
-    final targetMeans = _calibrationTargets;
-    double gazeMeanX = 0, gazeMeanY = 0, targetMeanX = 0, targetMeanY = 0;
-    for (int i = 0; i < gazeMeans.length; i++) {
-      gazeMeanX += gazeMeans[i].dx;
-      gazeMeanY += gazeMeans[i].dy;
-      targetMeanX += targetMeans[i].dx;
-      targetMeanY += targetMeans[i].dy;
-    }
-    gazeMeanX /= gazeMeans.length;
-    gazeMeanY /= gazeMeans.length;
-    targetMeanX /= targetMeans.length;
-    targetMeanY /= targetMeans.length;
-
-    double varGazeX = 0, varGazeY = 0, covX = 0, covY = 0;
-    for (int i = 0; i < gazeMeans.length; i++) {
-      final dxGaze = gazeMeans[i].dx - gazeMeanX;
-      final dyGaze = gazeMeans[i].dy - gazeMeanY;
-      varGazeX += dxGaze * dxGaze;
-      varGazeY += dyGaze * dyGaze;
-      covX += dxGaze * (targetMeans[i].dx - targetMeanX);
-      covY += dyGaze * (targetMeans[i].dy - targetMeanY);
-    }
-
-    varGazeX = varGazeX == 0 ? 1e-6 : varGazeX;
-    varGazeY = varGazeY == 0 ? 1e-6 : varGazeY;
-
-    final slopeX = covX / varGazeX;
-    final slopeY = covY / varGazeY;
-    final interceptX = targetMeanX - slopeX * gazeMeanX;
-    final interceptY = targetMeanY - slopeY * gazeMeanY;
-
-    setState(() {
-      _mappingSlope = Offset(slopeX, slopeY);
-      _mappingIntercept = Offset(interceptX, interceptY);
-      _phase = TrackerPhase.tracking;
-      _history.clear();
-    });
-
-    _log(
-      'Calibration complete. Slope: ${_formatOffset(_mappingSlope)}, '
-      'Intercept: ${_formatOffset(_mappingIntercept)}',
-    );
-  }
-
-  void _beginCalibrationRun() {
-    _calibrationTimer?.cancel();
-    _calibrationIndex = 0;
-    _displayTargetIndex = 0;
-    _phase = TrackerPhase.calibrating;
-    _startTargetWindow();
-  }
-
-  void _startTargetWindow() {
-    if (_calibrationIndex >= _calibrationTargets.length) {
-      _finalizeCalibration();
-      return;
-    }
-    _isCollecting = false;
-    _calibrationSamples[_calibrationIndex].clear();
-    _displayTargetIndex = _calibrationIndex;
-    _placeDotAtTarget(_displayTargetIndex);
-    _log(
-      'Target ${_calibrationIndex + 1}/${_calibrationTargets.length}: '
-      '${_dwellDuration.inSeconds}s dwell',
-    );
-    _collectDelayTimer?.cancel();
-    _collectDelayTimer = Timer(_settleDuration, () {
-      _isCollecting = true;
-      _log('Sampling target ${_calibrationIndex + 1} after settle.');
-    });
-    _calibrationTimer?.cancel();
-    _calibrationTimer = Timer(_dwellDuration, _startTransitionWindow);
-    setState(() {});
-  }
-
-  void _startTransitionWindow() {
-    _isCollecting = false;
-    _log(
-      'Transitioning to next target (${_travelDuration.inSeconds}s).',
-    );
-    _calibrationTimer?.cancel();
-    _displayTargetIndex = (_calibrationIndex + 1)
-        .clamp(0, _calibrationTargets.length - 1);
-    _placeDotAtTarget(_displayTargetIndex);
-    _calibrationTimer = Timer(_travelDuration, () {
-      _calibrationIndex++;
-      _startTargetWindow();
-    });
-    setState(() {});
-  }
-
-  void _placeDotAtTarget(int index) {
-    final screen = MediaQuery.of(context).size;
-    _dot = Offset(
-      _calibrationTargets[index].dx * screen.width,
-      _calibrationTargets[index].dy * screen.height,
-    );
-  }
-
   void _log(String message) {
     final now = DateTime.now();
     if (_lastLogAt == null || now.difference(_lastLogAt!) >= _logInterval) {
@@ -373,8 +212,6 @@ class _GazeTrackerState extends State<GazeTracker>
     _tracker.stopTracking();
     _tracker.dispose();
     _blink.dispose();
-    _collectDelayTimer?.cancel();
-    _calibrationTimer?.cancel();
     super.dispose();
   }
 
@@ -417,9 +254,7 @@ class _GazeTrackerState extends State<GazeTracker>
                 const Icon(Icons.visibility, color: Colors.white70),
                 const SizedBox(width: 8),
                 Text(
-                  _phase == TrackerPhase.calibrating
-                      ? 'Calibrating (${_calibrationIndex + 1}/${_calibrationTargets.length})'
-                      : (_tracking ? 'Tracking eyes' : 'Starting tracker...'),
+                  _tracking ? 'Tracking eyes' : 'Starting tracker...',
                   style: const TextStyle(color: Colors.white70),
                 ),
               ],
