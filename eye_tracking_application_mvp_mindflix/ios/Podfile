@@ -39,5 +39,16 @@ end
 post_install do |installer|
   installer.pods_project.targets.each do |target|
     flutter_additional_ios_build_settings(target)
+
+    target.build_configurations.each do |config|
+      # Evita warnings/errores por pods con target antiguo
+      config.build_settings['IPHONEOS_DEPLOYMENT_TARGET'] = '13.0'
+
+      # permission_handler_apple: habilita Camera permission
+      config.build_settings['GCC_PREPROCESSOR_DEFINITIONS'] ||= ['$(inherited)']
+      defs = config.build_settings['GCC_PREPROCESSOR_DEFINITIONS']
+      defs << 'PERMISSION_CAMERA=1' unless defs.include?('PERMISSION_CAMERA=1')
+    end
   end
 end
+
